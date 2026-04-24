@@ -2,7 +2,6 @@ import os
 import requests
 import re
 from telegram.ext import ApplicationBuilder, CommandHandler
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -59,7 +58,7 @@ def get_market():
 
 # -------- SIGNAL --------
 
-async def daily_job(app):
+async def daily_job(context):
     models = get_weather()
     probs = calc_probs(models)
     market = get_market()
@@ -86,7 +85,7 @@ Market:
     if price and price <= 0.38 and (probs[best] - second) >= 0.10:
         msg += "\n✅ BUY SIGNAL"
 
-    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
 # -------- BUY --------
 
@@ -100,7 +99,7 @@ async def buy(update, context):
 
 # -------- MONITOR --------
 
-async def monitor(app):
+async def monitor(context):
     if "active" not in positions:
         return
 
@@ -112,7 +111,7 @@ async def monitor(app):
     if price and price >= 0.50:
         profit = (price - pos["entry"]) / pos["entry"]
 
-        await app.bot.send_message(
+        await context.bot.send_message(
             chat_id=CHAT_ID,
             text=f"🚀 SELL {pos['temp']}°C @ {price} | Profit: {profit:.2%}"
         )
@@ -122,14 +121,11 @@ async def monitor(app):
 # -------- MAIN --------
 
 app = ApplicationBuilder().token(TOKEN).build()
+
 app.add_handler(CommandHandler("buy", buy))
 
-scheduler = AsyncIOScheduler()
-
-# тест режим (щохвилини)
-scheduler.add_job(daily_job, "interval", minutes=1, args=[app])
-scheduler.add_job(monitor, "interval", minutes=2, args=[app])
-
-scheduler.start()
+# 🔥 ВАЖЛИВО: використовуємо built-in scheduler Telegram
+app.job_queue.run_repeating(daily_job, interval=60, first=10)
+app.job_queue.run_repeating(monitor, interval=120, first=20)
 
 app.run_polling()
