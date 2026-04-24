@@ -1,9 +1,7 @@
 import os
 import requests
 import re
-from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = os.getenv("TOKEN")
@@ -61,7 +59,7 @@ def get_market():
 
 # -------- SIGNAL --------
 
-async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+async def daily_job(app):
     models = get_weather()
     probs = calc_probs(models)
     market = get_market()
@@ -88,11 +86,11 @@ Market:
     if price and price <= 0.38 and (probs[best] - second) >= 0.10:
         msg += "\n✅ BUY SIGNAL"
 
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
 
 # -------- BUY --------
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy(update, context):
     temp = int(context.args[0])
     price = float(context.args[1])
 
@@ -102,7 +100,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- MONITOR --------
 
-async def monitor(context: ContextTypes.DEFAULT_TYPE):
+async def monitor(app):
     if "active" not in positions:
         return
 
@@ -114,7 +112,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE):
     if price and price >= 0.50:
         profit = (price - pos["entry"]) / pos["entry"]
 
-        await context.bot.send_message(
+        await app.bot.send_message(
             chat_id=CHAT_ID,
             text=f"🚀 SELL {pos['temp']}°C @ {price} | Profit: {profit:.2%}"
         )
@@ -128,10 +126,9 @@ app.add_handler(CommandHandler("buy", buy))
 
 scheduler = AsyncIOScheduler()
 
-# 🔥 тест режим (потім заміниш на 14:00)
-scheduler.add_job(daily_job, "interval", minutes=1)
-
-scheduler.add_job(monitor, "interval", minutes=5)
+# тест режим (щохвилини)
+scheduler.add_job(daily_job, "interval", minutes=1, args=[app])
+scheduler.add_job(monitor, "interval", minutes=2, args=[app])
 
 scheduler.start()
 
