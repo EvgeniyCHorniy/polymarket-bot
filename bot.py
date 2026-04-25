@@ -49,24 +49,19 @@ def get_market():
     url = "https://gamma-api.polymarket.com/markets"
     data = requests.get(url).json()
 
-    tomorrow = datetime.utcnow() + timedelta(days=1)
-    date_str = tomorrow.strftime("%B %-d").lower()
-
-    market = None
+    candidates = []
 
     for m in data:
         q = m["question"].lower()
 
-        if (
-            "london" in q
-            and "highest temperature" in q
-            and date_str in q
-        ):
-            market = m
-            break
+        if "london" in q and "highest temperature" in q:
+            candidates.append(m)
 
-    if not market:
+    if not candidates:
         return None, None
+
+    # беремо найближчий по даті (перший активний)
+    market = candidates[0]
 
     prices = {}
 
