@@ -1,10 +1,13 @@
+import os
+
+TOKEN = os.getenv("BOT_TOKEN")
+
 import requests
 import json
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 
 EVENT_SLUG = "highest-temperature-in-london-on-april-27-2026"
 
