@@ -80,12 +80,6 @@ def get_prices(event):
 
         spread = ask - bid
 
-        if liq < 1000:
-            continue
-
-        if spread > 0.03:
-            continue
-
         result[name] = {
             "buy": round(ask * 100, 1),
             "sell": round(bid * 100, 1),
@@ -110,15 +104,15 @@ def pick_market(prices, forecast):
         except:
             continue
 
-        # Gaussian-like probability
         distance = abs(temp - forecast)
 
-        prob_score = distance ** 2  # штраф
+        # 🔥 спред лише впливає, але не блокує
+        spread_penalty = data["spread"] * 0.3
 
-        spread_penalty = data["spread"] / 10
-        liq_penalty = 0 if data["liq"] > 3000 else 1
+        # ліквідність — бонус
+        liq_bonus = -1 if data["liq"] > 3000 else 0
 
-        score = prob_score + spread_penalty + liq_penalty
+        score = distance + spread_penalty + liq_bonus
 
         if score < best_score:
             best_score = score
@@ -155,7 +149,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     temp, data = market
 
-    msg = f"""
+msg = f"""
 🌤 Forecast (EGLC adj): {forecast}°C
 
 🎯 Best Market: {temp}
@@ -163,7 +157,6 @@ BUY: {data['buy']}%
 SELL: {data['sell']}%
 Spread: {data['spread']}%
 Liquidity: {round(data['liq'])}
-
 """
 
     if data["buy"] < 38:
