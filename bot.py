@@ -81,48 +81,41 @@ def get_forecast_all():
 # =========================
 # POLYMARKET
 # =========================
-def get_prices(slug):
-    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+def get_prices(event_slug):
+    url = f"https://gamma-api.polymarket.com/events?slug={event_slug}"
+    data = requests.get(url).json()
 
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
+    results = []
 
-        if not data:
-            return None
+    for item in data:
+        q = item.get("question", "")
 
-        markets = data[0].get("markets", [])
-        results = []
+        # 🔥 Витягуємо температуру
+        import re
+        match = re.search(r'(\d+)\s*°', q)
+        if not match:
+            continue
 
-        for m in markets:
-            q = m.get("question", "")
-            bid = float(m.get("bestBid", 0))
-            ask = float(m.get("bestAsk", 0))
+        temp = int(match.group(1))
 
-            if bid == 0 and ask == 0:
-                continue
+        # 🔥 ціни
+        try:
+            yes_price = float(item.get("outcomePrices", [0])[0]) * 100
+            no_price = float(item.get("outcomePrices", [0, 0])[1]) * 100
+        except:
+            continue
 
-            temp = None
-            for t in range(5, 40):
-                if f"{t}°C" in q:
-                    temp = t
-                    break
+        spread = abs(yes_price - no_price)
 
-            if temp is None:
-                continue
+        results.append({
+            "temp": temp,
+            "buy": yes_price,
+            "sell": no_price,
+            "spread": spread,
+            "liq": float(item.get("liquidity", 0))
+        })
 
-            results.append({
-                "temp": temp,
-                "buy": round(ask * 100, 1),
-                "sell": round(bid * 100, 1),
-                "spread": round((ask - bid) * 100, 2),
-                "liq": float(m.get("liquidity", 0))
-            })
-
-        return results
-
-    except:
-        return None
+    return sorted(results, key=lambda x: x["temp"])
 
 
 # =========================
