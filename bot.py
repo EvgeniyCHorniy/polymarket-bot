@@ -23,21 +23,13 @@ def get_event_info():
 # =========================
 # WEATHER (REAL DATA)
 # =========================
+
 def get_forecast_all():
     sources = {}
 
-    # 1) Open-Meteo (no key)
-    try:
-        r = requests.get(
-            "https://api.open-meteo.com/v1/forecast?latitude=51.5&longitude=0.05&daily=temperature_2m_max&timezone=Europe/London",
-            timeout=10
-        )
-        data = r.json()
-        sources["OpenMeteo"] = round(data["daily"]["temperature_2m_max"][0])
-    except:
-        sources["OpenMeteo"] = None
-
-    # 2) Met.no (no key)
+    # =========================
+    # 1. Met.no (основа)
+    # =========================
     try:
         r = requests.get(
             "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=51.5&lon=0.05",
@@ -45,15 +37,19 @@ def get_forecast_all():
             timeout=10
         )
         data = r.json()
+
         temps = [
             t["data"]["instant"]["details"]["air_temperature"]
             for t in data["properties"]["timeseries"][:24]
         ]
+
         sources["MetNo"] = round(max(temps))
     except:
         sources["MetNo"] = None
 
-    # 3) VisualCrossing (fallback; без ключа часто дає обмежено, але не критично)
+    # =========================
+    # 2. VisualCrossing (часто ближче до реальності)
+    # =========================
     try:
         r = requests.get(
             "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/London/tomorrow?unitGroup=metric&include=days",
@@ -64,17 +60,46 @@ def get_forecast_all():
     except:
         sources["VisualCrossing"] = None
 
+    # =========================
+    # 3. WeatherAPI (безкоштовний ключ потрібен)
+    # =========================
+    try:
+        API_KEY = os.getenv("WEATHERAPI_KEY")
+        if API_KEY:
+            r = requests.get(
+                f"http://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q=London&days=1",
+                timeout=10
+            )
+            data = r.json()
+            sources["WeatherAPI"] = round(data["forecast"]["forecastday"][0]["day"]["maxtemp_c"])
+        else:
+            sources["WeatherAPI"] = None
+    except:
+        sources["WeatherAPI"] = None
+
+    # =========================
+    # FILTER + AVG
+    # =========================
     valid = [v for v in sources.values() if v is not None]
+
     if not valid:
         return {"sources": sources, "avg": None, "final": None}
 
+    # 👉 важливо: прибираємо екстремуми (як OpenMeteo косячив)
+    if len(valid) >= 3:
+        valid.sort()
+        valid = valid[1:-1]  # обрізаємо min/max
+
     avg = round(sum(valid) / len(valid), 1)
 
-    # EGLC bias (London City Airport трохи холодніше)
+    # EGLC bias (ключ!)
     final = round(avg - 0.5)
 
-    return {"sources": sources, "avg": avg, "final": final}
-
+    return {
+        "sources": sources,
+        "avg": avg,
+        "final": final
+    }
 
 # =========================
 # POLYMARKET (bestBid/Ask)
