@@ -1,10 +1,11 @@
 import os
 import requests
 import re
+from datetime import datetime, timedelta
 from telegram.ext import ApplicationBuilder, CommandHandler
 
 TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = int(os.getenv("CHAT_ID"))
 
 LAT = 51.5053
 LON = 0.0553
@@ -23,50 +24,79 @@ def get_weather():
         "met": data["daily"]["temperature_2m_max"][1] + 0.2
     }
 
-# -------- PROB --------
+# -------- PROB (з вагами) --------
 
 def calc_probs(models):
-    temps = range(15, 30)
+    weights = {
+        "ecmwf": 0.5,
+        "gfs": 0.2,
+        "met": 0.3
+    }
+
+    temps = range(10, 35)
     probs = {t: 0 for t in temps}
 
-    for temp in models.values():
+    for model, temp in models.items():
         for t in temps:
-            probs[t] += max(0, 1 - abs(temp - t) / 3)
+            probs[t] += weights[model] * max(0, 1 - abs(temp - t) / 3)
 
     total = sum(probs.values())
     return {k: v / total for k, v in probs.items()}
 
-# -------- MARKET --------
+# -------- MARKET (ТОЧНИЙ ПАРСИНГ) --------
 
 def get_market():
     url = "https://gamma-api.polymarket.com/markets"
     data = requests.get(url).json()
 
-    prices = {}
+    tomorrow = datetime.utcnow() + timedelta(days=1)
+    date_str = tomorrow.strftime("%B %-d").lower()
+
+    market = None
 
     for m in data:
         q = m["question"].lower()
 
-        if "london" in q and "temperature" in q:
-            for outcome in m["outcomes"]:
-                match = re.search(r"(\d+)", outcome["name"])
-                if match:
-                    temp = int(match.group(1))
-                    prices[temp] = float(outcome["price"])
+        if (
+            "london" in q
+            and "highest temperature" in q
+            and date_str in q
+        ):
+            market = m
+            break
 
-    return prices
+    if not market:
+        return None, None
+
+    prices = {}
+
+    for outcome in market["outcomes"]:
+        match = re.search(r"(\d+)", outcome["name"])
+        if match:
+            temp = int(match.group(1))
+            prices[temp] = float(outcome["price"])
+
+    slug = market.get("slug")
+    link = f"https://polymarket.com/market/{slug}" if slug else None
+
+    return prices, link
 
 # -------- SIGNAL --------
 
 async def daily_job(context):
     models = get_weather()
     probs = calc_probs(models)
-    market = get_market()
+    market, link = get_market()
+
+    if not market:
+        await context.bot.send_message(chat_id=CHAT_ID, text="❌ Market not found")
+        return
 
     best = max(probs, key=probs.get)
     second = sorted(probs.values(), reverse=True)[1]
 
-    price = market.get(best, None)
+    edge = probs[best] - second
+    price = market.get(best)
 
     msg = f"""
 📊 London (EGLC) – Tomorrow
@@ -77,17 +107,21 @@ Met: {models['met']:.1f}
 
 Top:
 {best}°C → {probs[best]:.0%}
+Edge: {edge:.0%}
 
 Market:
 {best}°C → {price}
+
+🔗 {link}
 """
 
-    if price and price <= 0.38 and (probs[best] - second) >= 0.10:
-        msg += "\n✅ BUY SIGNAL"
+    # ✅ BUY логіка
+    if price and 0.35 <= price <= 0.38 and edge >= 0.08:
+        msg += "\n\n✅ BUY SIGNAL"
 
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-# -------- BUY --------
+# -------- BUY (ручне підтвердження) --------
 
 async def buy(update, context):
     temp = int(context.args[0])
@@ -95,18 +129,18 @@ async def buy(update, context):
 
     positions["active"] = {"temp": temp, "entry": price}
 
-    await update.message.reply_text("✅ Position saved")
+    await update.message.reply_text(f"✅ Saved: {temp}°C @ {price}")
 
-# -------- MONITOR --------
+# -------- MONITOR SELL --------
 
 async def monitor(context):
     if "active" not in positions:
         return
 
-    market = get_market()
+    market, _ = get_market()
     pos = positions["active"]
 
-    price = market.get(pos["temp"], None)
+    price = market.get(pos["temp"])
 
     if price and price >= 0.50:
         profit = (price - pos["entry"]) / pos["entry"]
@@ -124,7 +158,7 @@ app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("buy", buy))
 
-# 🔥 ВАЖЛИВО: використовуємо built-in scheduler Telegram
+# тест режим (часто)
 app.job_queue.run_repeating(daily_job, interval=60, first=10)
 app.job_queue.run_repeating(monitor, interval=120, first=20)
 
