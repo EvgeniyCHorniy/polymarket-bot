@@ -1,124 +1,132 @@
-import requests
-import re
-from datetime import datetime, timedelta
-import asyncio
-from telegram import Bot
-from telegram.ext import ApplicationBuilder, ContextTypes
 import os
+import requests
+from datetime import datetime, timedelta
 
-# ================= CONFIG =================
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+)
 
+# =====================
+# ENV
+# =====================
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ================= MARKET PARSER =================
+# =====================
+# WEATHER MOCK (твоя логіка)
+# =====================
+def get_weather():
+    return {
+        "ECMWF": 19.6,
+        "GFS": 20.1,
+        "MET": 19.8
+    }
+
+def calc_probs(models):
+    probs = {}
+    for k, v in models.items():
+        rounded = round(v)
+        probs[rounded] = probs.get(rounded, 0) + 1/len(models)
+    return probs
+
+# =====================
+# POLYMARKET API
+# =====================
+def build_slug():
+    tomorrow = datetime.utcnow() + timedelta(days=1)
+    day = tomorrow.day
+    month = tomorrow.strftime("%B").lower()
+    year = tomorrow.year
+
+    return f"highest-temperature-in-london-on-{month}-{day}-{year}"
 
 def get_market():
-    url = "https://gamma-api.polymarket.com/events?active=true&closed=false"
+    slug = build_slug()
+
+    url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
 
     try:
-        data = requests.get(url, timeout=10).json()
-    except:
-        return None
+        r = requests.get(url, timeout=10)
 
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
-    target = tomorrow.strftime("%B %d").lower()
+        if r.status_code != 200:
+            return None, None
 
-    for event in data:
-        for m in event.get("markets", []):
-            q = m.get("question", "").lower()
+        data = r.json()
 
-            if "highest temperature in london" not in q:
-                continue
+        if not data:
+            return None, None
 
-            if target not in q:
-                continue
+        event = data
 
-            prices = {}
+        if "markets" not in event or not event["markets"]:
+            return None, None
 
-            for o in m.get("outcomes", []):
-                t = re.search(r"(\d+)", o.get("name", ""))
-                if t:
-                    prices[int(t.group(1))] = float(o.get("price", 0))
+        market = event["markets"][0]
 
-            if not prices:
-                continue
+        outcomes = market.get("outcomes", [])
+        prices = market.get("outcomePrices", [])
 
-            slug = m.get("slug", "")
-            link = f"https://polymarket.com/event/{slug}" if slug else ""
+        result = {}
+        for i in range(len(outcomes)):
+            result[outcomes[i]] = float(prices[i])
 
-            return prices, link, q
+        link = f"https://polymarket.com/event/{slug}"
 
-    return None
+        return result, link
 
-# ================= SIGNAL LOGIC =================
+    except Exception as e:
+        print("API ERROR:", e)
+        return None, None
 
-def format_signal(prices):
-    if not prices:
-        return "❌ No prices"
-
-    best_temp = max(prices, key=prices.get)
-    best_price = prices[best_temp]
-
-    msg = "📊 London (EGLC) – Tomorrow\n\n"
-
-    for t in sorted(prices.keys()):
-        msg += f"{t}°C → {round(prices[t]*100)}%\n"
-
-    msg += "\n🎯 Top:\n"
-    msg += f"{best_temp}°C → {round(best_price*100)}%\n"
-
-    if 0.35 <= best_price <= 0.38:
-        msg += "\n🟢 BUY zone (35–38%)"
-    elif best_price >= 0.50:
-        msg += "\n💰 SELL zone (50%+)"
-    else:
-        msg += "\n⏳ No action"
-
-    return msg
-
-# ================= BOT JOB =================
-
-LAST_SENT = None
-
+# =====================
+# JOB
+# =====================
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
-    global LAST_SENT
+    models = get_weather()
+    probs = calc_probs(models)
 
-    result = get_market()
+    market, link = get_market()
 
-    if not result:
-        if LAST_SENT != "no_market":
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text="⏳ Market not found yet"
-            )
-            LAST_SENT = "no_market"
-        return
+    if market is None:
+        text = "❌ Market not found"
+    else:
+        best = max(probs, key=probs.get)
+        prob = probs[best]
+        price = market.get(str(best), "N/A")
 
-    prices, link, q = result
+        text = f"""
+📊 London (Tomorrow)
 
-    signal = format_signal(prices)
-    text = f"{signal}\n\n🔗 {link}"
+ECMWF: {models['ECMWF']}
+GFS: {models['GFS']}
+MET: {models['MET']}
 
-    if text != LAST_SENT:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=text
-        )
-        LAST_SENT = text
+🎯 Top:
+{best}°C → {round(prob*100)}%
 
-# ================= MAIN =================
+💰 Market:
+{best}°C → {price}
 
-async def main():
+🔗 {link}
+"""
+
+    await context.bot.send_message(chat_id=CHAT_ID, text=text)
+
+# =====================
+# MAIN
+# =====================
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # запуск кожні 10 хв
+    # кожні 10 хв
     app.job_queue.run_repeating(daily_job, interval=600, first=5)
 
     print("Bot started")
 
-    await app.run_polling()
+    app.run_polling()
 
+# =====================
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
