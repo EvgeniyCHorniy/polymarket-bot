@@ -45,61 +45,34 @@ def calc_probs(models):
 
 # -------- MARKET (ТОЧНИЙ ПАРСИНГ) --------
 
-from datetime import datetime, timedelta
 import requests
-import re
 
-def get_market():
-    url = "https://gamma-api.polymarket.com/markets"
+def find_london_market():
+    url = "https://gamma-api.polymarket.com/events?active=true&closed=false"
     data = requests.get(url).json()
 
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
+    target = "april 26"
 
-    best_market = None
-    best_diff = 999
+    for event in data:
+        for m in event.get("markets", []):
+            q = m.get("question", "").lower()
 
-    for m in data:
-        q = m.get("question", "").lower()
+            if "highest temperature in london" in q and target in q:
+                prices = {}
 
-        # 1. базовий фільтр
-        if "highest temperature in london" not in q:
-            continue
+                for o in m["outcomes"]:
+                    import re
+                    t = re.search(r"(\d+)", o["name"])
+                    if t:
+                        prices[int(t.group(1))] = float(o["price"])
 
-        # 2. дістаємо дату
-        match = re.search(r"on ([a-z]+ \d+)", q)
-        if not match:
-            continue
+                return {
+                    "question": m["question"],
+                    "prices": prices,
+                    "slug": m.get("slug")
+                }
 
-        try:
-            market_date = datetime.strptime(match.group(1), "%B %d").date()
-            market_date = market_date.replace(year=today.year)
-        except:
-            continue
-
-        # 3. шукаємо найближчий (today/tomorrow)
-        diff = (market_date - today).days
-
-        if 0 <= diff <= 1 and diff < best_diff:
-            best_diff = diff
-            best_market = m
-
-    if not best_market:
-        return None
-
-    # 4. ціни
-    prices = {}
-
-    for outcome in best_market["outcomes"]:
-        t = re.search(r"(\d+)", outcome["name"])
-        if t:
-            prices[int(t.group(1))] = float(outcome["price"])
-
-    return {
-        "question": best_market["question"],
-        "prices": prices,
-        "slug": best_market.get("slug")
-    }
+    return None
 
 # -------- SIGNAL --------
 
