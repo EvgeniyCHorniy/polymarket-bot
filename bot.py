@@ -43,38 +43,48 @@ def build_slug():
     return f"highest-temperature-in-london-on-{month}-{day}-{year}"
 
 def get_market():
-    slug = build_slug()
-
-    url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
+    url = "https://gamma-api.polymarket.com/events?active=true&closed=false"
 
     try:
         r = requests.get(url, timeout=10)
-
-        if r.status_code != 200:
-            return None, None
-
         data = r.json()
 
-        if not data:
-            return None, None
+        tomorrow = datetime.utcnow() + timedelta(days=1)
+        day = str(tomorrow.day)
+        month = tomorrow.strftime("%B")
+        year = str(tomorrow.year)
 
-        event = data
+        target_words = [
+            "london",
+            "highest temperature",
+            month.lower(),
+            day,
+            year
+        ]
 
-        if "markets" not in event or not event["markets"]:
-            return None, None
+        for event in data:
+            title = (event.get("title") or "").lower()
 
-        market = event["markets"][0]
+            if all(word in title for word in target_words):
+                markets = event.get("markets", [])
+                if not markets:
+                    continue
 
-        outcomes = market.get("outcomes", [])
-        prices = market.get("outcomePrices", [])
+                market = markets[0]
 
-        result = {}
-        for i in range(len(outcomes)):
-            result[outcomes[i]] = float(prices[i])
+                outcomes = market.get("outcomes", [])
+                prices = market.get("outcomePrices", [])
 
-        link = f"https://polymarket.com/event/{slug}"
+                result = {}
+                for i in range(len(outcomes)):
+                    result[outcomes[i]] = float(prices[i])
 
-        return result, link
+                slug = event.get("slug")
+                link = f"https://polymarket.com/event/{slug}"
+
+                return result, link
+
+        return None, None
 
     except Exception as e:
         print("API ERROR:", e)
