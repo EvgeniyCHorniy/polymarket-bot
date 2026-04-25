@@ -1,35 +1,38 @@
 import os
 import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN not set")
 
 # =========================
-# DATE → ALWAYS TOMORROW
+# DATE (London timezone)
 # =========================
-def get_event_info():
-    d = datetime.utcnow() + timedelta(days=1)
-    slug = f"highest-temperature-in-london-on-{d.strftime('%B').lower()}-{d.day}-{d.year}"
-    date_str = d.strftime("%Y-%m-%d")
+def get_event_info(day="tomorrow"):
+    now = datetime.now(ZoneInfo("Europe/London"))
+
+    if day == "today":
+        target = now
+    else:
+        target = now + timedelta(days=1)
+
+    slug = f"highest-temperature-in-london-on-{target.strftime('%B').lower()}-{target.day}-{target.year}"
+    date_str = target.strftime("%Y-%m-%d")
     url = f"https://polymarket.com/event/{slug}"
+
     return slug, date_str, url
 
 
 # =========================
-# WEATHER (REAL DATA)
+# WEATHER (REAL)
 # =========================
-
 def get_forecast_all():
     sources = {}
 
-    # =========================
-    # 1. Met.no (основа)
-    # =========================
+    # Met.no
     try:
         r = requests.get(
             "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=51.5&lon=0.05",
@@ -47,9 +50,7 @@ def get_forecast_all():
     except:
         sources["MetNo"] = None
 
-    # =========================
-    # 2. VisualCrossing (часто ближче до реальності)
-    # =========================
+    # VisualCrossing
     try:
         r = requests.get(
             "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/London/tomorrow?unitGroup=metric&include=days",
@@ -60,39 +61,14 @@ def get_forecast_all():
     except:
         sources["VisualCrossing"] = None
 
-    # =========================
-    # 3. WeatherAPI (безкоштовний ключ потрібен)
-    # =========================
-    try:
-        API_KEY = os.getenv("WEATHERAPI_KEY")
-        if API_KEY:
-            r = requests.get(
-                f"http://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q=London&days=1",
-                timeout=10
-            )
-            data = r.json()
-            sources["WeatherAPI"] = round(data["forecast"]["forecastday"][0]["day"]["maxtemp_c"])
-        else:
-            sources["WeatherAPI"] = None
-    except:
-        sources["WeatherAPI"] = None
-
-    # =========================
-    # FILTER + AVG
-    # =========================
     valid = [v for v in sources.values() if v is not None]
 
     if not valid:
         return {"sources": sources, "avg": None, "final": None}
 
-    # 👉 важливо: прибираємо екстремуми (як OpenMeteo косячив)
-    if len(valid) >= 3:
-        valid.sort()
-        valid = valid[1:-1]  # обрізаємо min/max
-
     avg = round(sum(valid) / len(valid), 1)
 
-    # EGLC bias (ключ!)
+    # EGLC bias
     final = round(avg - 0.5)
 
     return {
@@ -101,8 +77,9 @@ def get_forecast_all():
         "final": final
     }
 
+
 # =========================
-# POLYMARKET (bestBid/Ask)
+# POLYMARKET
 # =========================
 def get_prices(slug):
     url = f"https://gamma-api.polymarket.com/events?slug={slug}"
@@ -110,6 +87,7 @@ def get_prices(slug):
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
+
         if not data:
             return None
 
@@ -118,68 +96,64 @@ def get_prices(slug):
 
         for m in markets:
             q = m.get("question", "")
-            bid = m.get("bestBid") or 0
-            ask = m.get("bestAsk") or 0
+            bid = float(m.get("bestBid", 0))
+            ask = float(m.get("bestAsk", 0))
 
-            # пропускаємо пусті
             if bid == 0 and ask == 0:
                 continue
 
-            # дістаємо температуру з питання
             temp = None
             for t in range(5, 40):
                 if f"{t}°C" in q:
                     temp = t
                     break
+
             if temp is None:
                 continue
 
             results.append({
                 "temp": temp,
-                "buy": round(ask * 100, 1),   # купуєш по ask
-                "sell": round(bid * 100, 1),  # продаєш по bid
+                "buy": round(ask * 100, 1),
+                "sell": round(bid * 100, 1),
                 "spread": round((ask - bid) * 100, 2),
                 "liq": float(m.get("liquidity", 0))
             })
 
-        return results if results else None
+        return results
 
-    except Exception as e:
-        print("API error:", e)
+    except:
         return None
 
 
 # =========================
-# STRATEGY (t-1, t, t+1 → найдешевший)
+# STRATEGY (forecast ±1)
 # =========================
 def select_trade(results, forecast):
     if not results or forecast is None:
         return None, []
 
-    temps = [r["temp"] for r in results]
-    nearest = min(temps, key=lambda t: abs(t - forecast))
+    targets = [forecast - 1, forecast, forecast + 1]
 
-    candidates = []
-    for t in [nearest - 1, nearest, nearest + 1]:
-        for r in results:
-            if r["temp"] == t:
-                candidates.append(r)
+    selected = [r for r in results if r["temp"] in targets]
 
-    if not candidates:
+    if not selected:
         return None, []
 
-    # найдешевший buy поруч із прогнозом
-    best = min(candidates, key=lambda x: x["buy"])
-    return best, sorted(candidates, key=lambda x: x["temp"])
+    selected = sorted(selected, key=lambda x: x["temp"])
+
+    best = min(selected, key=lambda x: x["buy"])
+
+    return best, selected
 
 
 # =========================
-# MONITOR (SELL ≥ 50%)
+# MONITOR
 # =========================
 async def monitor(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     temp = context.job.data["temp"]
     slug = context.job.data["slug"]
+    day = context.job.data["day"]
 
     results = get_prices(slug)
     if not results:
@@ -189,66 +163,81 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE):
         if r["temp"] == temp and r["buy"] >= 50:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🚀 SELL SIGNAL\n{temp}°C → {r['buy']}%"
+                text=f"🚀 SELL SIGNAL {temp}°C ({day}) → {r['buy']}%"
             )
             context.job.schedule_removal()
-            break
 
 
 # =========================
-# /start
+# CORE LOGIC
 # =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    slug, date_str, poly_url = get_event_info()
+async def run(update, context, day):
+    slug, date_str, url = get_event_info(day)
 
-    f = get_forecast_all()
+    forecast_data = get_forecast_all()
+    forecast = forecast_data["final"]
+
     results = get_prices(slug)
 
     if not results:
-        await update.message.reply_text("❌ No market data (можливо маркет ще не відкрився)")
+        await update.message.reply_text("❌ No market data")
         return
 
-    best, nearby = select_trade(results, f["final"])
+    best, selected = select_trade(results, forecast)
 
-    # формуємо повідомлення
     msg = f"""
-📅 Date: {date_str}
-🔗 {poly_url}
+📅 {day.upper()} → {date_str}
+🔗 {url}
 
 🌤 Forecast:
-OpenMeteo: {f['sources'].get('OpenMeteo')}
-MetNo: {f['sources'].get('MetNo')}
-VisualCrossing: {f['sources'].get('VisualCrossing')}
+MetNo: {forecast_data['sources'].get('MetNo')}
+VisualCrossing: {forecast_data['sources'].get('VisualCrossing')}
 
-📊 Avg: {f['avg']}
-🧭 EGLC adj: {f['final']}
+📊 Avg: {forecast_data['avg']}
+🧭 EGLC: {forecast}
 
-🎯 Target zone:
+🎯 Target (±1):
 """
 
-    for r in nearby:
-        mark = "👉" if best and r["temp"] == best["temp"] else "  "
-        msg += f"\n{mark} {r['temp']}°C → BUY {r['buy']}% | SELL {r['sell']}% | spread {r['spread']}%"
+    for r in selected:
+        mark = "👉" if best and r["temp"] == best["temp"] else ""
+        msg += f"\n{mark}{r['temp']}°C → BUY {r['buy']}% | SELL {r['sell']}%"
 
     if best:
-        msg += f"\n\n🔥 BEST ENTRY: {best['temp']}°C ({best['buy']}%)"
+        msg += f"\n\n🔥 BEST: {best['temp']}°C ({best['buy']}%)"
+
         if best["buy"] < 38:
-            msg += "\n💰 BUY SIGNAL (<38%) → /buy"
-        context.user_data["last_temp"] = best["temp"]
+            msg += "\n💰 BUY SIGNAL → /buy"
+
+        context.user_data["temp"] = best["temp"]
         context.user_data["slug"] = slug
+        context.user_data["day"] = day
 
     await update.message.reply_text(msg)
 
 
 # =========================
-# /buy
+# COMMANDS
 # =========================
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    temp = context.user_data.get("last_temp")
-    slug = context.user_data.get("slug")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run(update, context, "tomorrow")
 
-    if not temp or not slug:
-        await update.message.reply_text("❌ Спочатку /start")
+
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run(update, context, "today")
+
+
+async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run(update, context, "tomorrow")
+
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    temp = context.user_data.get("temp")
+    slug = context.user_data.get("slug")
+    day = context.user_data.get("day")
+
+    if not temp:
+        await update.message.reply_text("❌ Спочатку /today або /tomorrow")
         return
 
     context.job_queue.run_repeating(
@@ -258,11 +247,12 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data={
             "chat_id": update.effective_chat.id,
             "temp": temp,
-            "slug": slug
+            "slug": slug,
+            "day": day
         }
     )
 
-    await update.message.reply_text(f"👀 Monitoring {temp}°C (sell ≥50%)")
+    await update.message.reply_text(f"👀 Monitoring {temp}°C ({day})")
 
 
 # =========================
@@ -272,6 +262,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("tomorrow", tomorrow))
     app.add_handler(CommandHandler("buy", buy))
 
     print("🚀 Bot started")
