@@ -45,36 +45,61 @@ def calc_probs(models):
 
 # -------- MARKET (ТОЧНИЙ ПАРСИНГ) --------
 
+from datetime import datetime, timedelta
+import requests
+import re
+
 def get_market():
     url = "https://gamma-api.polymarket.com/markets"
     data = requests.get(url).json()
 
-    candidates = []
+    today = datetime.utcnow().date()
+    tomorrow = today + timedelta(days=1)
+
+    best_market = None
+    best_diff = 999
 
     for m in data:
-        q = m["question"].lower()
+        q = m.get("question", "").lower()
 
-        if "london" in q and "highest temperature" in q:
-            candidates.append(m)
+        # 1. базовий фільтр
+        if "highest temperature in london" not in q:
+            continue
 
-    if not candidates:
-        return None, None
+        # 2. дістаємо дату
+        match = re.search(r"on ([a-z]+ \d+)", q)
+        if not match:
+            continue
 
-    # беремо найближчий по даті (перший активний)
-    market = candidates[0]
+        try:
+            market_date = datetime.strptime(match.group(1), "%B %d").date()
+            market_date = market_date.replace(year=today.year)
+        except:
+            continue
 
+        # 3. шукаємо найближчий (today/tomorrow)
+        diff = (market_date - today).days
+
+        if 0 <= diff <= 1 and diff < best_diff:
+            best_diff = diff
+            best_market = m
+
+    if not best_market:
+        return None
+
+    # 4. ціни
     prices = {}
 
-    for outcome in market["outcomes"]:
-        match = re.search(r"(\d+)", outcome["name"])
-        if match:
-            temp = int(match.group(1))
-            prices[temp] = float(outcome["price"])
+    for outcome in best_market["outcomes"]:
+        t = re.search(r"(\d+)", outcome["name"])
+        if t:
+            prices[int(t.group(1))] = float(outcome["price"])
 
-    slug = market.get("slug")
-    link = f"https://polymarket.com/market/{slug}" if slug else None
-
-    return prices, link
+    return {
+        "question": best_market["question"],
+        "prices": prices,
+        "slug": best_market.get("slug")
+    }
 
 # -------- SIGNAL --------
 
