@@ -1,158 +1,124 @@
-import os
 import requests
 import re
 from datetime import datetime, timedelta
-from telegram.ext import ApplicationBuilder, CommandHandler
+import asyncio
+from telegram import Bot
+from telegram.ext import ApplicationBuilder, ContextTypes
+import os
 
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
+# ================= CONFIG =================
 
-LAT = 51.5053
-LON = 0.0553
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-positions = {}
+# ================= MARKET PARSER =================
 
-# -------- WEATHER --------
-
-def get_weather():
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}&daily=temperature_2m_max&timezone=Europe/London"
-    data = requests.get(url).json()
-
-    return {
-        "ecmwf": data["daily"]["temperature_2m_max"][1],
-        "gfs": data["daily"]["temperature_2m_max"][1] + 0.5,
-        "met": data["daily"]["temperature_2m_max"][1] + 0.2
-    }
-
-# -------- PROB (з вагами) --------
-
-def calc_probs(models):
-    weights = {
-        "ecmwf": 0.5,
-        "gfs": 0.2,
-        "met": 0.3
-    }
-
-    temps = range(10, 35)
-    probs = {t: 0 for t in temps}
-
-    for model, temp in models.items():
-        for t in temps:
-            probs[t] += weights[model] * max(0, 1 - abs(temp - t) / 3)
-
-    total = sum(probs.values())
-    return {k: v / total for k, v in probs.items()}
-
-# -------- MARKET (ТОЧНИЙ ПАРСИНГ) --------
-
-import requests
-
-def find_london_market():
+def get_market():
     url = "https://gamma-api.polymarket.com/events?active=true&closed=false"
-    data = requests.get(url).json()
 
-    target = "april 26"
+    try:
+        data = requests.get(url, timeout=10).json()
+    except:
+        return None
+
+    today = datetime.utcnow().date()
+    tomorrow = today + timedelta(days=1)
+    target = tomorrow.strftime("%B %d").lower()
 
     for event in data:
         for m in event.get("markets", []):
             q = m.get("question", "").lower()
 
-            if "highest temperature in london" in q and target in q:
-                prices = {}
+            if "highest temperature in london" not in q:
+                continue
 
-                for o in m["outcomes"]:
-                    import re
-                    t = re.search(r"(\d+)", o["name"])
-                    if t:
-                        prices[int(t.group(1))] = float(o["price"])
+            if target not in q:
+                continue
 
-                return {
-                    "question": m["question"],
-                    "prices": prices,
-                    "slug": m.get("slug")
-                }
+            prices = {}
+
+            for o in m.get("outcomes", []):
+                t = re.search(r"(\d+)", o.get("name", ""))
+                if t:
+                    prices[int(t.group(1))] = float(o.get("price", 0))
+
+            if not prices:
+                continue
+
+            slug = m.get("slug", "")
+            link = f"https://polymarket.com/event/{slug}" if slug else ""
+
+            return prices, link, q
 
     return None
 
-# -------- SIGNAL --------
+# ================= SIGNAL LOGIC =================
 
-async def daily_job(context):
-    models = get_weather()
-    probs = calc_probs(models)
-    market, link = get_market()
+def format_signal(prices):
+    if not prices:
+        return "❌ No prices"
 
-    if not market:
-        await context.bot.send_message(chat_id=CHAT_ID, text="❌ Market not found")
+    best_temp = max(prices, key=prices.get)
+    best_price = prices[best_temp]
+
+    msg = "📊 London (EGLC) – Tomorrow\n\n"
+
+    for t in sorted(prices.keys()):
+        msg += f"{t}°C → {round(prices[t]*100)}%\n"
+
+    msg += "\n🎯 Top:\n"
+    msg += f"{best_temp}°C → {round(best_price*100)}%\n"
+
+    if 0.35 <= best_price <= 0.38:
+        msg += "\n🟢 BUY zone (35–38%)"
+    elif best_price >= 0.50:
+        msg += "\n💰 SELL zone (50%+)"
+    else:
+        msg += "\n⏳ No action"
+
+    return msg
+
+# ================= BOT JOB =================
+
+LAST_SENT = None
+
+async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    global LAST_SENT
+
+    result = get_market()
+
+    if not result:
+        if LAST_SENT != "no_market":
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text="⏳ Market not found yet"
+            )
+            LAST_SENT = "no_market"
         return
 
-    best = max(probs, key=probs.get)
-    second = sorted(probs.values(), reverse=True)[1]
+    prices, link, q = result
 
-    edge = probs[best] - second
-    price = market.get(best)
+    signal = format_signal(prices)
+    text = f"{signal}\n\n🔗 {link}"
 
-    msg = f"""
-📊 London (EGLC) – Tomorrow
-
-ECMWF: {models['ecmwf']:.1f}
-GFS: {models['gfs']:.1f}
-Met: {models['met']:.1f}
-
-Top:
-{best}°C → {probs[best]:.0%}
-Edge: {edge:.0%}
-
-Market:
-{best}°C → {price}
-
-🔗 {link}
-"""
-
-    # ✅ BUY логіка
-    if price and 0.35 <= price <= 0.38 and edge >= 0.08:
-        msg += "\n\n✅ BUY SIGNAL"
-
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-
-# -------- BUY (ручне підтвердження) --------
-
-async def buy(update, context):
-    temp = int(context.args[0])
-    price = float(context.args[1])
-
-    positions["active"] = {"temp": temp, "entry": price}
-
-    await update.message.reply_text(f"✅ Saved: {temp}°C @ {price}")
-
-# -------- MONITOR SELL --------
-
-async def monitor(context):
-    if "active" not in positions:
-        return
-
-    market, _ = get_market()
-    pos = positions["active"]
-
-    price = market.get(pos["temp"])
-
-    if price and price >= 0.50:
-        profit = (price - pos["entry"]) / pos["entry"]
-
+    if text != LAST_SENT:
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=f"🚀 SELL {pos['temp']}°C @ {price} | Profit: {profit:.2%}"
+            text=text
         )
+        LAST_SENT = text
 
-        del positions["active"]
+# ================= MAIN =================
 
-# -------- MAIN --------
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-app = ApplicationBuilder().token(TOKEN).build()
+    # запуск кожні 10 хв
+    app.job_queue.run_repeating(daily_job, interval=600, first=5)
 
-app.add_handler(CommandHandler("buy", buy))
+    print("Bot started")
 
-# тест режим (часто)
-app.job_queue.run_repeating(daily_job, interval=60, first=10)
-app.job_queue.run_repeating(monitor, interval=120, first=20)
+    await app.run_polling()
 
-app.run_polling()
+if __name__ == "__main__":
+    asyncio.run(main())
