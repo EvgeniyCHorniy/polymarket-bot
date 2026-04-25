@@ -1,248 +1,242 @@
 import os
+import json
+import asyncio
 import requests
 from datetime import datetime, timedelta
-
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ===== CONFIG =====
-CITY = "London"
-LAT = 51.5072
-LON = -0.1276
-
-# ===== STORAGE =====
-ACTIVE_TRADE = {
-    "target": None
-}
-
+EVENT_SLUG = "highest-temperature-in-london-on-april-27-2026"
 
 # =========================
-# WEATHER (3 sources)
+# WEATHER (3 SOURCES)
 # =========================
 
 def get_weather():
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}&daily=temperature_2m_max&timezone=UTC"
-        data = requests.get(url, timeout=10).json()
-        open_meteo = data["daily"]["temperature_2m_max"][1]
-    except:
-        open_meteo = None
+    temps = []
 
     try:
-        wt = requests.get(f"https://wttr.in/{CITY}?format=j1", timeout=10).json()
-        wttr = float(wt["weather"][1]["maxtempC"])
+        # Open-Meteo
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast?latitude=51.5&longitude=0.0&daily=temperature_2m_max&timezone=UTC"
+        ).json()
+        temps.append(r["daily"]["temperature_2m_max"][1])
     except:
-        wttr = None
+        pass
 
     try:
-        url = f"https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={LAT}&lon={LON}"
-        headers = {"User-Agent": "weather-bot"}
-        data = requests.get(url, headers=headers, timeout=10).json()
-        met = data["properties"]["timeseries"][0]["data"]["instant"]["details"]["air_temperature"]
+        # Met.no
+        r = requests.get(
+            "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=51.5&lon=0.0"
+        ).json()
+        temps.append(r["properties"]["timeseries"][12]["data"]["instant"]["details"]["air_temperature"])
     except:
-        met = None
+        pass
 
-    return {
-        "open_meteo": open_meteo,
-        "wttr": wttr,
-        "met": met
-    }
+    try:
+        # wttr.in (fallback)
+        r = requests.get("https://wttr.in/London?format=j1").json()
+        temps.append(float(r["weather"][1]["maxtempC"]))
+    except:
+        pass
 
-
-def apply_bias(temp, wind=3, clouds=50):
-    if temp is None:
+    if not temps:
         return None
 
-    bias = 0
+    # Weighted (ECMWF-like bias)
+    avg = sum(temps) / len(temps)
 
-    if wind > 5:
-        bias -= 0.7
-    if clouds > 70:
-        bias -= 0.5
-
-    # EGLC bias
-    bias += 0.3
-
-    return round(temp + bias, 1)
+    # EGLC bias (-1°C)
+    return round(avg - 1, 1)
 
 
 # =========================
 # POLYMARKET
 # =========================
 
-def get_event_slug():
-    tomorrow = datetime.utcnow() + timedelta(days=1)
-    date_str = tomorrow.strftime("%B-%-d-%Y").lower()
-    return f"highest-temperature-in-london-on-{date_str}"
-
-
 def get_event():
-    slug = get_event_slug()
-
-    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-
-    try:
-        data = requests.get(url, timeout=10).json()
-        if not data:
-            return None
-
-        return data[0]
-    except:
-        return None
+    url = f"https://gamma-api.polymarket.com/events?slug={EVENT_SLUG}"
+    r = requests.get(url)
+    return r.json()[0]
 
 
 def get_prices(event):
     result = {}
 
-    markets = event.get("markets", [])
-    if not isinstance(markets, list) or not markets:
-        return result
+    for m in event["markets"]:
+        name = m.get("groupItemTitle")
 
-    market = markets[0]
+        bid = m.get("bestBid")
+        ask = m.get("bestAsk")
+        liq = m.get("liquidityNum", 0)
 
-    outcomes = market.get("outcomes", [])
-    prices = market.get("outcomePrices", [])
+        if not name or bid is None or ask is None:
+            continue
 
-    if not isinstance(outcomes, list) or not isinstance(prices, list):
-        return result
+        if bid == 0 or ask == 0:
+            continue
 
-    if len(outcomes) != len(prices):
-        return result
+        spread = ask - bid
 
-    for i in range(len(outcomes)):
-        name = outcomes[i]
+        if liq < 1000:
+            continue
 
-        try:
-            price = float(prices[i]) * 100
-        except:
-            price = 0
+        if spread > 0.03:
+            continue
 
-        result[name] = round(price, 1)
+        result[name] = {
+            "buy": round(ask * 100, 1),
+            "sell": round(bid * 100, 1),
+            "spread": round(spread * 100, 2),
+            "liq": liq
+        }
 
     return result
 
 
 # =========================
-# ANALYSIS
+# PROBABILISTIC PICK
 # =========================
 
-def analyze():
-    weather = get_weather()
+def pick_market(prices, forecast):
+    best = None
+    best_score = 999
 
-    temps = [t for t in weather.values() if t is not None]
-    if not temps:
-        return "❌ No weather data"
+    for temp_str, data in prices.items():
+        try:
+            temp = int(temp_str.replace("°C", ""))
+        except:
+            continue
 
-    avg = sum(temps) / len(temps)
-    adjusted = apply_bias(avg)
+        # Gaussian-like probability
+        distance = abs(temp - forecast)
 
-    event = get_event()
-    if not event:
-        return "❌ Market not found"
+        prob_score = distance ** 2  # штраф
 
-    prices = get_prices(event)
-    if not prices:
-        return "❌ No prices"
+        spread_penalty = data["spread"] / 10
+        liq_penalty = 0 if data["liq"] > 3000 else 1
 
-    # find closest temp
-    closest = min(prices.keys(), key=lambda x: abs(float(x.replace("°C", "")) - adjusted))
-    prob = prices[closest]
+        score = prob_score + spread_penalty + liq_penalty
 
-    msg = f"""
-📊 Weather:
-OpenMeteo: {weather['open_meteo']}
-WTTR: {weather['wttr']}
-MET: {weather['met']}
+        if score < best_score:
+            best_score = score
+            best = (temp_str, data)
 
-🎯 Adjusted: {adjusted}°C
-Best match: {closest}
-Market: {prob}%
-
-🔗 https://polymarket.com/event/{event['slug']}
-"""
-
-    if prob < 38:
-        msg += "\n🟢 BUY SIGNAL"
-
-    return msg, closest, prob
+    return best
 
 
 # =========================
-# TELEGRAM
+# TELEGRAM COMMANDS
 # =========================
+
+active_trade = None
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = analyze()
+    forecast = get_weather()
+    event = get_event()
+    prices = get_prices(event)
 
-    if isinstance(result, str):
-        await update.message.reply_text(result)
+    if not forecast:
+        await update.message.reply_text("❌ Weather error")
         return
 
-    msg, closest, prob = result
+    if not prices:
+        await update.message.reply_text("❌ No prices")
+        return
+
+    market = pick_market(prices, forecast)
+
+    if not market:
+        await update.message.reply_text("❌ No valid market")
+        return
+
+    temp, data = market
+
+    msg = f"""
+🌤 Forecast (EGLC adj): {forecast}°C
+
+🎯 Best Market: {temp}
+BUY: {data['buy']}%
+SELL: {data['sell']}%
+Spread: {data['spread']}%
+Liquidity: {round(data['liq'])}
+
+"""
+
+    if data["buy"] < 38:
+        msg += "\n🔥 SIGNAL: BUY (<38%)"
+
     await update.message.reply_text(msg)
 
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = analyze()
+# =========================
+# BUY + MONITOR
+# =========================
 
-    if isinstance(result, str):
-        await update.message.reply_text(result)
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global active_trade
+
+    forecast = get_weather()
+    event = get_event()
+    prices = get_prices(event)
+
+    market = pick_market(prices, forecast)
+
+    if not market:
+        await update.message.reply_text("❌ No market")
         return
 
-    msg, closest, prob = result
+    temp, data = market
 
-    ACTIVE_TRADE["target"] = closest
+    active_trade = {
+        "temp": temp
+    }
 
-    await update.message.reply_text(f"✅ Tracking {closest} ({prob}%)")
+    await update.message.reply_text(f"✅ Tracking {temp}")
 
 
 async def monitor(context: ContextTypes.DEFAULT_TYPE):
-    if not ACTIVE_TRADE["target"]:
+    global active_trade
+
+    if not active_trade:
         return
 
     event = get_event()
-    if not event:
-        return
-
     prices = get_prices(event)
-    target = ACTIVE_TRADE["target"]
 
-    if target not in prices:
+    temp = active_trade["temp"]
+
+    if temp not in prices:
         return
 
-    prob = prices[target]
+    price = prices[temp]["sell"]
 
-    if prob >= 50:
+    if price >= 50:
         await context.bot.send_message(
             chat_id=context.job.chat_id,
-            text=f"💰 SELL SIGNAL {target} now {prob}%"
+            text=f"💰 SELL SIGNAL {temp} @ {price}%"
         )
-        ACTIVE_TRADE["target"] = None
+        active_trade = None
 
 
 # =========================
 # MAIN
 # =========================
 
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.bot.delete_webhook(drop_pending_updates=True)
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
 
-    app.job_queue.run_repeating(monitor, interval=60)
+    app.job_queue.run_repeating(monitor, interval=60, first=10)
 
-    print("Bot started")
-    app.run_polling()
+    print("🚀 Bot started")
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
