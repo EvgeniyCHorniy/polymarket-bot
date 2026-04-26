@@ -82,15 +82,19 @@ def get_forecast_all():
 # POLYMARKET
 # =========================
 def get_prices(event_slug):
-    url = f"https://gamma-api.polymarket.com/markets?slug={event_slug}"
+    url = f"https://gamma-api.polymarket.com/events?slug={event_slug}"
     data = requests.get(url).json()
 
-    results = []
+    if not data:
+        return []
 
+    markets = data[0].get("markets", [])
+
+    results = []
     import re
 
-    for item in data:
-        q = item.get("question", "")
+    for m in markets:
+        q = m.get("question", "")
 
         match = re.search(r'(\d+)\s*°', q)
         if not match:
@@ -99,7 +103,7 @@ def get_prices(event_slug):
         temp = int(match.group(1))
 
         try:
-            prices = item.get("outcomePrices", [])
+            prices = m.get("outcomePrices", [])
             if len(prices) < 2:
                 continue
 
@@ -115,7 +119,7 @@ def get_prices(event_slug):
             "buy": buy,
             "sell": sell,
             "spread": spread,
-            "liq": float(item.get("liquidity", 0))
+            "liq": float(m.get("liquidity", 0))
         })
 
     return sorted(results, key=lambda x: x["temp"])
