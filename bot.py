@@ -1,136 +1,114 @@
 import os
 import requests
-import re
 from datetime import datetime, timedelta
-
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-
 # =========================
-# DATE
+# DATE + SLUG
 # =========================
-
-def get_date(mode="today"):
+def get_target_date(mode="today"):
     now = datetime.utcnow()
     if mode == "tomorrow":
         now += timedelta(days=1)
-    return now
 
+    date_str = now.strftime("%Y-%m-%d")
+    day = str(int(now.strftime("%d")))
+    month = now.strftime("%B").lower()
 
-def get_date_str(mode="today"):
-    d = get_date(mode)
-    return d.strftime("%B %d").replace(" 0", " ")  # April 6
+    slug = f"highest-temperature-in-london-on-{month}-{day}-2026"
 
-
-def get_event_slug(mode="today"):
-    d = get_date(mode)
-
-    day = d.strftime("%-d") if "%" in "%-d" else str(int(d.strftime("%d")))
-    month = d.strftime("%B").lower()
-
-    return f"highest-temperature-in-london-on-{month}-{day}-2026"
-
-
-def get_polymarket_url(mode="today"):
-    return f"https://polymarket.com/event/{get_event_slug(mode)}"
+    return date_str, slug
 
 
 # =========================
-# FORECAST (simple stable)
+# FORECAST (MET.NO)
 # =========================
-
 def get_forecast():
     try:
         url = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
-        params = {"lat": 51.5, "lon": -0.1}
-        headers = {"User-Agent": "bot"}
+        headers = {"User-Agent": "weather-bot"}
 
-        data = requests.get(url, params=params, headers=headers, timeout=5).json()
+        params = {"lat": 51.5074, "lon": 0.0553}
+
+        r = requests.get(url, headers=headers, params=params, timeout=5)
+        data = r.json()
 
         temps = []
         for item in data["properties"]["timeseries"][:10]:
             temps.append(item["data"]["instant"]["details"]["air_temperature"])
 
-        return round(max(temps))
+        return round(sum(temps) / len(temps))
     except:
         return None
 
 
 # =========================
-# POLYMARKET (STABLE)
+# POLYMARKET
 # =========================
-
-def extract_temp(q):
-    match = re.search(r'(\d+)\s*°', q)
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def get_prices(event_slug):
-    url = f"https://gamma-api.polymarket.com/events?slug={event_slug}"
-
+def get_markets(slug):
     try:
-        data = requests.get(url, timeout=5).json()
-    except:
-        return []
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
 
-    results = []
+        if not data or len(data) == 0:
+            return []
 
-    # 🔥 підтримка ОБОХ форматів (це ключ)
-    if isinstance(data, list) and len(data) > 0:
-        if "markets" in data[0]:
-            items = data[0]["markets"]
-        else:
-            items = data
-    else:
-        return []
+        markets = data[0].get("markets", [])
 
-    for item in items:
-        q = item.get("question", "")
+        parsed = []
 
-        temp = extract_temp(q)
-        if temp is None:
-            continue
+        for m in markets:
+            try:
+                question = m.get("question", "")
+                if "°C" not in question:
+                    continue
 
-        try:
-            prices = item.get("outcomePrices", [])
-            if len(prices) < 2:
+                temp = int(question.split("be ")[1].split("°")[0])
+
+                outcomes = m.get("outcomes", [])
+                if len(outcomes) < 2:
+                    continue
+
+                yes = outcomes[0]
+
+                buy = float(yes.get("price", 0)) * 100
+                sell = float(yes.get("price", 0)) * 100  # fallback
+
+                spread = abs(buy - sell)
+
+                parsed.append({
+                    "temp": temp,
+                    "buy": round(buy, 1),
+                    "sell": round(sell, 1),
+                    "spread": round(spread, 1),
+                    "liq": float(m.get("liquidity", 0))
+                })
+
+            except:
                 continue
 
-            buy = float(prices[0]) * 100
-            sell = float(prices[1]) * 100
-        except:
-            continue
+        return parsed
 
-        results.append({
-            "temp": temp,
-            "buy": buy,
-            "sell": sell,
-            "spread": abs(buy - sell),
-            "liq": float(item.get("liquidity", 0))
-        })
-
-    return sorted(results, key=lambda x: x["temp"])
+    except Exception as e:
+        return []
 
 
 # =========================
 # MESSAGE BUILDER
 # =========================
-
-def build_message(mode):
-    date_str = get_date(mode).strftime("%Y-%m-%d")
-    url = get_polymarket_url(mode)
+def build_message(mode="today"):
+    date_str, slug = get_target_date(mode)
+    url = f"https://polymarket.com/event/{slug}"
 
     forecast = get_forecast()
+    markets = get_markets(slug)
 
-    prices = get_prices(get_event_slug(mode))
-
-    if not prices:
-        return "❌ No market data"
+    if not markets:
+        return f"❌ No market data\n{url}"
 
     msg = f"📅 {mode.upper()} → {date_str}\n🔗 {url}\n\n"
 
@@ -140,27 +118,42 @@ def build_message(mode):
     if forecast is None:
         return msg + "❌ No forecast"
 
-    msg += f"🎯 Target (±1 from {forecast}°C):\n\n"
+    msg += f"🎯 Target (±1 around {forecast}°C):\n\n"
 
     targets = [forecast - 1, forecast, forecast + 1]
 
     found = False
 
     for t in targets:
-        for p in prices:
-            if p["temp"] == t:
-                found = True
-                msg += f"{t}°C → BUY {p['buy']:.1f}% | SELL {p['sell']:.1f}% | spread {p['spread']:.1f}%\n"
+        m = next((x for x in markets if x["temp"] == t), None)
+
+        if not m:
+            continue
+
+        found = True
+
+        marker = "👉" if t == forecast else "•"
+
+        msg += (
+            f"{marker} {t}°C → "
+            f"BUY {m['buy']}% | "
+            f"SELL {m['sell']}% | "
+            f"spread {m['spread']}% | "
+            f"liq {int(m['liq'])}\n"
+        )
 
     if not found:
-        msg += "⚠️ No matching temps in market\n"
+        msg += "❌ No matching temps found\n"
 
-    # best entry (мінімальний buy)
-    candidates = [p for p in prices if p["temp"] in targets]
+    # BEST ENTRY
+    best = None
+    for m in markets:
+        if abs(m["temp"] - forecast) <= 1:
+            if not best or m["buy"] < best["buy"]:
+                best = m
 
-    if candidates:
-        best = min(candidates, key=lambda x: x["buy"])
-        msg += f"\n🔥 BEST: {best['temp']}°C ({best['buy']:.1f}%)"
+    if best:
+        msg += f"\n🔥 BEST ENTRY: {best['temp']}°C ({best['buy']}%)"
 
     return msg
 
@@ -168,25 +161,29 @@ def build_message(mode):
 # =========================
 # HANDLERS
 # =========================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Use /today or /tomorrow")
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = build_message("today")
-    await update.message.reply_text(msg)
+    try:
+        msg = build_message("today")
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = build_message("tomorrow")
-    await update.message.reply_text(msg)
+    try:
+        msg = build_message("tomorrow")
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 # =========================
 # MAIN
 # =========================
-
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -194,6 +191,7 @@ def main():
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("tomorrow", tomorrow))
 
+    print("🚀 Bot started")
     app.run_polling()
 
 
