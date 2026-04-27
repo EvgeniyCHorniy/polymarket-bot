@@ -925,10 +925,19 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lbl, pct = find_outcome_for_temp(outcomes, temp_int) if outcomes else (None, None)
 
     if not lbl:
-        await update.message.reply_text(
-            f"⚠️ Не знайдено outcome для *{temp_int}°C* на Polymarket.\n🔗 {link}",
-            parse_mode="Markdown",
-        )
+        # Debug: показуємо що реально прийшло з API
+        debug_lines = [f"⚠️ Не знайдено outcome для *{temp_int}°C* на Polymarket.\n"]
+        if not markets:
+            debug_lines.append("_API повернув 0 markets — ринок не відкрито або slug невірний_")
+        else:
+            debug_lines.append(f"_Знайдено {len(markets)} markets. Нормалізовані labels:_")
+            for i, mkt in enumerate(markets[:8]):
+                raw_q = mkt.get("question", "?")[:60]
+                norm  = _normalize_temp_label(mkt.get("question", ""))
+                debug_lines.append(f"  `{i+1}. {raw_q}`")
+                debug_lines.append(f"     `→ {norm}`")
+        debug_lines.append(f"\n🔗 {link}")
+        await update.message.reply_text("\n".join(debug_lines), parse_mode="Markdown")
         return
 
     dk = _date_key(dt)
