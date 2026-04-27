@@ -1,568 +1,437 @@
 """
-London EGLC Temperature Polymarket Bot v3
+London EGLC Temperature Polymarket Bot v4
 ==========================================
 
-НОВИНИ v3:
-  1. Відкидання аутлаєрів — якщо джерело відхиляється > OUTLIER_THRESHOLD від
-     медіани інших → його вага падає до 0.05 (практично ігнорується).
-     Причина: wttr.in іноді дає 13°C коли інші 17°C — це псує прогноз.
+НОВЕ в v4:
+  1. 3 найточніші моделі для Лондона (Open-Meteo, без ключів):
+       ECMWF IFS      /v1/forecast?models=ecmwf_ifs04  (9 км)
+       DWD ICON       /v1/dwd-icon                      (2 км, найкращий для Європи)
+       UK Met Office  /v1/ukmo                          (2 км, офіційний британський)
+     + Погодинний max: беремо hourly і рахуємо max самі (точніше ніж daily)
+     + Поправка на хмарність (☀️+0.5°C / ☁️-0.3°C) та вітер (💨 до -0.6°C)
 
-  2. Паралельний мультидатний моніторинг — можна відкрити /buy для кількох
-     дат одночасно. monitoring[] → словник {date_key: {...}}
+  2. Тренд ціни + Momentum:
+     - Зберігаємо ціну кожні 2 хв у price_history.json
+     - ASCII sparkline графік
+     - Momentum алерт якщо ціна змінилась > 5% за 30 хв
 
-  3. Авто-BUY сигнал — щоденний о 14:00 Kyiv та вранці о 8:00 Kyiv бот
-     сам надсилає "🟢 КУПУЙ" якщо outcome < 38%
+  3. Стоп-лос та Тейк-профіт:
+     /buy 17 29.04 --stop 20 --tp 65
 
-  4. Ранковий уточнений прогноз о 8:00 Kyiv (прогноз точніший вранці дня)
+  4. Авто-скан ринків о 09:00 Kyiv (1-4 дні вперед, BUY < 38%)
 
-  5. /positions — список всіх активних моніторингів
+  5. Ранковий брифінг о 07:30 Kyiv:
+     погода + позиції + нагадування записати факт
 
-  6. /sell <DD.MM> — закрити конкретну дату, /sell all — всі
-
-  7. Консенсус з Polymarket — показує різницю між прогнозом і ринком
+  6. Кнопки (Reply Keyboard) — не треба пам'ятати команди
+     + Inline кнопки під позиціями (Закрити / Тренд)
 
 ВСТАНОВЛЕННЯ:
   pip install "python-telegram-bot[job-queue]==20.*" requests pytz
 
 ENV VARS:
-  BOT_TOKEN           — токен Telegram бота
-  CHAT_ID             — chat_id куди слати алерти (з /start)
-  TOMORROW_API_KEY    — (опційно) ключ tomorrow.io
-
-КОМАНДИ:
-  /start                  — довідка
-  /check  [DD.MM]         — прогноз EGLC + Polymarket (default: завтра)
-  /check2                 — прогноз для завтра І після завтра разом
-  /poll   [DD.MM]         — лише ціни Polymarket
-  /forecast [DD.MM]       — лише погода (3 джерела)
-  /buy <temp> [DD.MM]     — відкрити моніторинг (напр. /buy 17 28.04)
-  /sell [DD.MM|all]       — закрити моніторинг для дати або всі
-  /positions              — всі активні моніторинги + поточні ціни
-  /status [DD.MM]         — деталі одного моніторингу
-  /history                — точність джерел (накопичена статистика)
-  /actual <src> <pred> <fact> [month] — записати факт для навчання
+  BOT_TOKEN  CHAT_ID  TOMORROW_API_KEY (опційно)
 """
 
-import os
-import re
-import json
-import logging
-import pytz
-import requests
+import os, re, json, logging, requests, pytz
+import threading, time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telegram import Update, Bot
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
-# всі import-и вище 👆
 
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import time
-
-# === HTTP server ===
-class Handler(BaseHTTPRequestHandler):
+# Keep-alive for Render
+class _KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        pass
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
+def _run_web() -> None:
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), _KeepAliveHandler)
+    logging.getLogger(__name__).info('Keep-alive HTTP on port %d', port)
     server.serve_forever()
 
-# === self-ping ===
-def self_ping():
-    url = os.getenv("RENDER_EXTERNAL_URL")
+def _self_ping() -> None:
+    url = os.getenv('RENDER_EXTERNAL_URL')
     if not url:
-        print("⚠️ RENDER_EXTERNAL_URL not set")
+        logging.getLogger(__name__).warning('RENDER_EXTERNAL_URL not set, self-ping disabled')
         return
     while True:
         try:
             requests.get(url, timeout=10)
-            print("🔁 self ping OK")
+            logging.getLogger(__name__).info('self-ping OK')
         except Exception as e:
-            print(f"ping error: {e}")
+            logging.getLogger(__name__).warning('self-ping error: %s', e)
         time.sleep(300)
 
-threading.Thread(target=run_web, daemon=True).start()
-threading.Thread(target=self_ping, daemon=True).start()
+def start_keep_alive() -> None:
+    threading.Thread(target=_run_web,   daemon=True, name='web_server').start()
+    threading.Thread(target=_self_ping, daemon=True, name='self_ping').start()
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+
+from telegram import (
+    Update, Bot,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
 )
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters,
+)
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN            = os.getenv("BOT_TOKEN")
 CHAT_ID          = os.getenv("CHAT_ID")
 TOMORROW_API_KEY = os.getenv("TOMORROW_API_KEY", "")
 
-KYIV_TZ  = pytz.timezone("Europe/Kiev")
-
-# EGLC — London City Airport (офіційна станція Polymarket)
-EGLC_LAT = 51.5048
-EGLC_LON = 0.0495
-
-# Якщо джерело відхиляється від медіани інших більше ніж на X°C — аутлаєр
-OUTLIER_THRESHOLD = 2.0
-
-HISTORY_FILE = Path("eglc_history.json")
-
-BUY_SIGNAL_MAX_PCT  = 38.0   # нижче — сигнал "КУПУЙ"
-SELL_SIGNAL_MIN_PCT = 50.0   # вище — сигнал "ПРОДАВАЙ"
-ALERT_LEVELS = [40, 50, 60, 70, 80, 90]
-
+KYIV_TZ            = pytz.timezone("Europe/Kiev")
+EGLC_LAT           = 51.5048
+EGLC_LON           = 0.0495
+OUTLIER_THRESHOLD  = 2.0
+BUY_MAX_PCT        = 38.0
+MOMENTUM_THRESHOLD = 5.0
+HISTORY_FILE       = Path("eglc_history.json")
+PRICE_HISTORY_FILE = Path("price_history.json")
+ALERT_LEVELS       = [40, 50, 60, 70, 80, 90]
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HISTORICAL BIAS
 # ══════════════════════════════════════════════════════════════════════════════
 
 BASE_EGLC_BIAS: dict[int, float] = {
-    1: 0.3,  2: 0.4,  3: 0.6,  4: 0.9,
-    5: 1.1,  6: 1.3,  7: 1.4,  8: 1.3,
+    1: 0.3, 2: 0.4, 3: 0.6, 4: 0.9,
+    5: 1.1, 6: 1.3, 7: 1.4, 8: 1.3,
     9: 1.0, 10: 0.7, 11: 0.4, 12: 0.3,
 }
-
 SOURCE_STATS: dict = {}
 
 
 def load_history() -> None:
     global SOURCE_STATS
     if HISTORY_FILE.exists():
-        try:
-            SOURCE_STATS = json.loads(HISTORY_FILE.read_text())
-            logger.info("History loaded: %d sources", len(SOURCE_STATS))
-        except Exception as exc:
-            logger.warning("History load error: %s", exc)
+        try: SOURCE_STATS = json.loads(HISTORY_FILE.read_text())
+        except Exception as e: logger.warning("History: %s", e)
 
 
 def save_history() -> None:
-    try:
-        HISTORY_FILE.write_text(json.dumps(SOURCE_STATS, indent=2))
-    except Exception as exc:
-        logger.error("History save error: %s", exc)
+    try: HISTORY_FILE.write_text(json.dumps(SOURCE_STATS, indent=2))
+    except Exception as e: logger.error("Save history: %s", e)
 
 
 def record_actual(source: str, month: int, predicted: float, actual: float) -> None:
     error = predicted - actual
     key = str(month)
-    SOURCE_STATS.setdefault(source, {}).setdefault(
-        key, {"bias": 0.0, "mae": 0.0, "n": 0}
-    )
-    s = SOURCE_STATS[source][key]
-    n = s["n"]
+    SOURCE_STATS.setdefault(source, {}).setdefault(key, {"bias": 0.0, "mae": 0.0, "n": 0})
+    s = SOURCE_STATS[source][key]; n = s["n"]
     s["bias"] = (s["bias"] * n + error) / (n + 1)
     s["mae"]  = (s["mae"]  * n + abs(error)) / (n + 1)
-    s["n"]    = n + 1
+    s["n"] = n + 1
     save_history()
 
 
 def get_learned_bias(source: str, month: int) -> float:
     s = SOURCE_STATS.get(source, {}).get(str(month), {})
-    if s.get("n", 0) >= 5:
-        return -s["bias"]
+    if s.get("n", 0) >= 5: return -s["bias"]
     return BASE_EGLC_BIAS.get(month, 0.5)
 
 
 def source_accuracy_str(source: str, month: int) -> str:
     s = SOURCE_STATS.get(source, {}).get(str(month), {})
     n = s.get("n", 0)
-    if n >= 3:
-        return f"MAE {s['mae']:.1f}°C, зміщ {s['bias']:+.1f}°C (n={n})"
+    if n >= 3: return f"MAE {s['mae']:.1f}°C, зміщ {s['bias']:+.1f}°C (n={n})"
     return f"мало даних (n={n})"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WEATHER SOURCES
+#  PRICE HISTORY
+# ══════════════════════════════════════════════════════════════════════════════
+
+price_history: dict = {}
+
+
+def load_price_history() -> None:
+    global price_history
+    if PRICE_HISTORY_FILE.exists():
+        try: price_history = json.loads(PRICE_HISTORY_FILE.read_text())
+        except: price_history = {}
+
+
+def save_price_history() -> None:
+    try: PRICE_HISTORY_FILE.write_text(json.dumps(price_history, indent=2))
+    except Exception as e: logger.error("Save price history: %s", e)
+
+
+def record_price(date_key: str, label: str, pct: float) -> None:
+    price_history.setdefault(date_key, [])
+    price_history[date_key].append({
+        "ts": datetime.utcnow().isoformat(timespec="minutes"),
+        "label": label, "pct": pct,
+    })
+    if len(price_history[date_key]) > 500:
+        price_history[date_key] = price_history[date_key][-500:]
+    save_price_history()
+
+
+def get_trend(date_key: str, label: str, minutes: int = 180) -> dict | None:
+    history = [h for h in price_history.get(date_key, []) if h["label"] == label]
+    if len(history) < 2: return None
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat(timespec="minutes")
+    recent = [h for h in history if h["ts"] >= cutoff]
+    if len(recent) < 2: recent = history[-20:]
+    first_pct = recent[0]["pct"]; last_pct = recent[-1]["pct"]
+    delta = round(last_pct - first_pct, 1)
+    cutoff_30 = (datetime.utcnow() - timedelta(minutes=30)).isoformat(timespec="minutes")
+    last_30   = [h for h in recent if h["ts"] >= cutoff_30]
+    momentum  = round(last_pct - last_30[0]["pct"], 1) if len(last_30) >= 2 else 0.0
+    vals = [h["pct"] for h in recent[-20:]]
+    mn, mx = min(vals), max(vals)
+    chars = "▁▂▃▄▅▆▇█"
+    spark = "".join(chars[int((v-mn)/(mx-mn)*7)] if mx != mn else "▄" for v in vals)
+    return {"first": first_pct, "last": last_pct, "delta": delta,
+            "momentum": momentum, "n": len(recent), "spark": spark, "minutes": minutes}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WEATHER — 3 найточніші моделі для Лондона
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _safe_get(url: str, **kwargs) -> dict | None:
     try:
         r = requests.get(url, timeout=12, **kwargs)
-        r.raise_for_status()
-        return r.json()
-    except Exception as exc:
-        logger.error("GET %.90s → %s", url, exc)
-        return None
+        r.raise_for_status(); return r.json()
+    except Exception as e:
+        logger.error("GET %.80s → %s", url, e); return None
 
 
-def fetch_openmeteo(dt: datetime) -> dict | None:
-    """Open-Meteo ECMWF — найточніша модель для Європи, без ключа."""
+def _hourly_max(data: dict, ds: str) -> tuple[float | None, float | None, float, float]:
+    """Рахуємо max температуру з погодинних даних самостійно — точніше ніж daily."""
+    h = data.get("hourly", {})
+    times = h.get("time", [])
+    temps  = h.get("temperature_2m", [])
+    clouds = h.get("cloudcover", h.get("cloud_cover", []))
+    winds  = h.get("windspeed_10m", [])
+    dt, dn, dc, dw = [], [], [], []
+    for i, t in enumerate(times):
+        if not t.startswith(ds): continue
+        if i < len(temps)  and temps[i]  is not None: dt.append(float(temps[i]))
+        if i < len(clouds) and clouds[i] is not None: dc.append(float(clouds[i]))
+        if i < len(winds)  and winds[i]  is not None: dw.append(float(winds[i]))
+    if not dt: return None, None, 0.0, 0.0
+    return (max(dt), min(dt),
+            round(sum(dc)/len(dc), 1) if dc else 0.0,
+            round(sum(dw)/len(dw), 1) if dw else 0.0)
+
+
+def _wx_correction(temp: float, cloud: float, wind: float) -> tuple[float, str]:
+    """Поправка на хмарність і вітер."""
+    corr = 0.0; notes = []
+    if cloud < 20:   corr += 0.5; notes.append("☀️+0.5")
+    elif cloud > 70: corr -= 0.3; notes.append("☁️-0.3")
+    if wind > 35:    corr -= 0.6; notes.append("💨-0.6")
+    elif wind > 20:  corr -= 0.3; notes.append("💨-0.3")
+    return round(temp + corr, 1), (" ".join(notes) if notes else "—")
+
+
+def _build_source(name: str, data: dict, ds: str) -> dict | None:
+    tmax, tmin, cloud, wind = _hourly_max(data, ds)
+    if tmax is None: return None
+    wx_temp, wx_note = _wx_correction(tmax, cloud, wind)
+    return {"source": name, "temp_max": tmax, "temp_min": tmin,
+            "cloud": cloud, "wind": wind, "wx_note": wx_note, "wx_corrected": wx_temp}
+
+
+def fetch_ecmwf(dt: datetime) -> dict | None:
+    """ECMWF IFS — 9 км, найточніший глобально."""
     ds = dt.strftime("%Y-%m-%d")
-    data = _safe_get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude":  EGLC_LAT,
-            "longitude": EGLC_LON,
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,"
-                     "windspeed_10m_max,precipitation_probability_max",
-            "timezone":   "Europe/London",
-            "start_date": ds,
-            "end_date":   ds,
-        },
-    )
-    if not data:
-        return None
-    d = data.get("daily", {})
-    if not d.get("temperature_2m_max"):
-        return None
-    return {
-        "source":   "Open-Meteo",
-        "temp_max": float(d["temperature_2m_max"][0]),
-        "temp_min": float(d["temperature_2m_min"][0]),
-        "precip":   float((d.get("precipitation_sum") or [0])[0] or 0),
-        "wind":     float((d.get("windspeed_10m_max") or [0])[0] or 0),
-        "rain_pct": int((d.get("precipitation_probability_max") or [0])[0] or 0),
-    }
+    data = _safe_get("https://api.open-meteo.com/v1/forecast", params={
+        "latitude": EGLC_LAT, "longitude": EGLC_LON,
+        "hourly": "temperature_2m,cloudcover,windspeed_10m",
+        "timezone": "Europe/London", "start_date": ds, "end_date": ds,
+        "models": "ecmwf_ifs04",
+    })
+    return _build_source("ECMWF", data, ds) if data else None
 
 
-def fetch_wttr(dt: datetime) -> dict | None:
-    """wttr.in GFS-based, безкоштовно. Дає 3 дні."""
-    data = _safe_get(
-        "https://wttr.in/London+City+Airport",
-        params={"format": "j1"},
-        headers={"User-Agent": "WeatherBot/3.0"},
-    )
-    if not data:
-        return None
-    idx = (dt.date() - datetime.utcnow().date()).days
-    weather = data.get("weather", [])
-    if idx < 0 or idx >= len(weather):
-        return None
-    w = weather[idx]
-    hourly   = w.get("hourly", [])
-    rain_pct = 0
-    if hourly:
-        rain_pct = int(sum(int(h.get("chanceofrain", 0)) for h in hourly) / len(hourly))
-    wind = float(hourly[4]["windspeedKmph"]) if len(hourly) > 4 else (
-        float(hourly[-1]["windspeedKmph"]) if hourly else 0.0
-    )
-    return {
-        "source":   "wttr.in",
-        "temp_max": float(w["maxtempC"]),
-        "temp_min": float(w["mintempC"]),
-        "precip":   0.0,
-        "wind":     wind,
-        "rain_pct": rain_pct,
-    }
-
-
-def fetch_tomorrow_io(dt: datetime) -> dict | None:
-    """Tomorrow.io Timeline API. Потрібен TOMORROW_API_KEY."""
-    if not TOMORROW_API_KEY:
-        return None
+def fetch_dwd_icon(dt: datetime) -> dict | None:
+    """DWD ICON — 2 км, найточніший для Центральної Європи."""
     ds = dt.strftime("%Y-%m-%d")
-    data = _safe_get(
-        "https://api.tomorrow.io/v4/timelines",
-        params={
-            "location":  f"{EGLC_LAT},{EGLC_LON}",
-            "fields":    ["temperatureMax", "temperatureMin",
-                          "precipitationIntensityAvg", "windSpeedMax",
-                          "precipitationProbability"],
-            "timesteps": "1d",
-            "startTime": f"{ds}T00:00:00Z",
-            "endTime":   f"{ds}T23:59:59Z",
-            "units":     "metric",
-            "apikey":    TOMORROW_API_KEY,
-        },
-    )
-    if not data:
-        return None
-    try:
-        intervals = data["data"]["timelines"][0]["intervals"]
-        v = intervals[0]["values"]
-        return {
-            "source":   "Tomorrow.io",
-            "temp_max": float(v.get("temperatureMax", 0) or 0),
-            "temp_min": float(v.get("temperatureMin", 0) or 0),
-            "precip":   float(v.get("precipitationIntensityAvg", 0) or 0),
-            "wind":     float(v.get("windSpeedMax", 0) or 0),
-            "rain_pct": int(v.get("precipitationProbability", 0) or 0),
-        }
-    except (KeyError, IndexError, TypeError) as exc:
-        logger.error("Tomorrow.io parse: %s", exc)
-        return None
+    data = _safe_get("https://api.open-meteo.com/v1/dwd-icon", params={
+        "latitude": EGLC_LAT, "longitude": EGLC_LON,
+        "hourly": "temperature_2m,cloudcover,windspeed_10m",
+        "timezone": "Europe/London", "start_date": ds, "end_date": ds,
+    })
+    return _build_source("DWD ICON", data, ds) if data else None
 
 
-def fetch_noaa_gfs(dt: datetime) -> dict | None:
-    """NOAA GFS через Open-Meteo — fallback якщо Tomorrow.io немає."""
+def fetch_ukmet(dt: datetime) -> dict | None:
+    """UK Met Office — 2 км, офіційна британська служба."""
     ds = dt.strftime("%Y-%m-%d")
-    data = _safe_get(
-        "https://api.open-meteo.com/v1/gfs",
-        params={
-            "latitude":   EGLC_LAT,
-            "longitude":  EGLC_LON,
-            "daily":      "temperature_2m_max,temperature_2m_min",
-            "timezone":   "Europe/London",
-            "start_date": ds,
-            "end_date":   ds,
-        },
-    )
-    if not data:
-        return None
-    d = data.get("daily", {})
-    if not d.get("temperature_2m_max"):
-        return None
-    return {
-        "source":   "NOAA/GFS",
-        "temp_max": float(d["temperature_2m_max"][0]),
-        "temp_min": float(d["temperature_2m_min"][0]),
-        "precip":   0.0,
-        "wind":     0.0,
-        "rain_pct": 0,
-    }
+    # Пробуємо два можливих endpoint
+    for url, params in [
+        ("https://api.open-meteo.com/v1/ukmo", {
+            "latitude": EGLC_LAT, "longitude": EGLC_LON,
+            "hourly": "temperature_2m,cloudcover,windspeed_10m",
+            "timezone": "Europe/London", "start_date": ds, "end_date": ds,
+        }),
+        ("https://api.open-meteo.com/v1/forecast", {
+            "latitude": EGLC_LAT, "longitude": EGLC_LON,
+            "hourly": "temperature_2m,cloudcover,windspeed_10m",
+            "timezone": "Europe/London", "start_date": ds, "end_date": ds,
+            "models": "uk_met_office",
+        }),
+    ]:
+        data = _safe_get(url, params=params)
+        if data:
+            result = _build_source("UK Met Office", data, ds)
+            if result: return result
+    return None
 
 
 def get_all_sources(dt: datetime) -> list[dict]:
     sources = []
-    for fetcher in (fetch_openmeteo, fetch_wttr):
+    for fetcher in (fetch_ecmwf, fetch_dwd_icon, fetch_ukmet):
         r = fetcher(dt)
-        if r:
-            sources.append(r)
-    third = fetch_tomorrow_io(dt) or fetch_noaa_gfs(dt)
-    if third:
-        sources.append(third)
+        if r: sources.append(r)
+        else: logger.warning("%s failed for %s", fetcher.__name__, dt.date())
     return sources
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  OUTLIER DETECTION + FORECAST AGGREGATION
+#  FORECAST AGGREGATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-SOURCE_WEIGHTS = {
-    "Open-Meteo":  0.40,
-    "wttr.in":     0.25,
-    "Tomorrow.io": 0.35,
-    "NOAA/GFS":    0.35,
-}
+SOURCE_WEIGHTS = {"ECMWF": 0.35, "DWD ICON": 0.35, "UK Met Office": 0.30}
 
 
 def _median(vals: list[float]) -> float:
-    s = sorted(vals)
-    n = len(s)
-    return s[n // 2] if n % 2 == 1 else round((s[n//2-1] + s[n//2]) / 2, 1)
+    s = sorted(vals); n = len(s)
+    return s[n//2] if n % 2 else round((s[n//2-1]+s[n//2])/2, 1)
 
 
 def detect_outliers(sources: list[dict]) -> list[dict]:
-    """
-    Знаходить аутлаєри серед прогнозів.
-    Якщо джерело відхиляється від медіани ІНШИХ на > OUTLIER_THRESHOLD —
-    позначає як аутлаєр і зменшує вагу до 0.05.
-
-    Це вирішує проблему типу wttr.in=13°C vs Open-Meteo=17°C, NOAA=16°C.
-    """
     if len(sources) < 2:
-        for s in sources:
-            s["outlier"] = False
-            s["outlier_delta"] = 0.0
+        for s in sources: s["outlier"] = False; s["outlier_delta"] = 0.0
         return sources
-
     for s in sources:
-        others = [o["temp_max"] for o in sources if o["source"] != s["source"]]
-        if not others:
-            s["outlier"] = False
-            s["outlier_delta"] = 0.0
-            continue
-        med_others = _median(others)
-        delta = abs(s["temp_max"] - med_others)
-        s["outlier"]       = delta > OUTLIER_THRESHOLD
-        s["outlier_delta"] = round(delta, 1)
-
+        others = [o["wx_corrected"] for o in sources if o["source"] != s["source"]]
+        med    = _median(others) if others else s["wx_corrected"]
+        delta  = abs(s["wx_corrected"] - med)
+        s["outlier"] = delta > OUTLIER_THRESHOLD; s["outlier_delta"] = round(delta, 1)
     return sources
 
 
 def compute_forecast(dt: datetime) -> dict:
-    """Агрегація прогнозів з детекцією аутлаєрів і EGLC-поправкою."""
-    raw_sources = get_all_sources(dt)
-    if not raw_sources:
-        return {"error": "Не вдалось отримати дані жодного джерела погоди"}
-
-    raw_sources = detect_outliers(raw_sources)
+    raw = get_all_sources(dt)
+    if not raw: return {"error": "Не вдалось отримати дані жодного джерела погоди"}
+    raw = detect_outliers(raw)
     month = dt.month
     enriched = []
-    for s in raw_sources:
+    for s in raw:
         bias      = get_learned_bias(s["source"], month)
-        corrected = round(s["temp_max"] + bias, 1)
-        enriched.append({
-            **s,
-            "bias":      bias,
-            "corrected": corrected,
-            "accuracy":  source_accuracy_str(s["source"], month),
-        })
-
-    # Ваги з урахуванням аутлаєрів
-    w_sum, w_total = 0.0, 0.0
+        corrected = round(s["wx_corrected"] + bias, 1)
+        enriched.append({**s, "bias": bias, "corrected": corrected,
+                         "accuracy": source_accuracy_str(s["source"], month)})
+    w_sum, w_tot = 0.0, 0.0
     for s in enriched:
-        w = SOURCE_WEIGHTS.get(s["source"], 0.30)
-        if s.get("outlier"):
-            w = 0.05   # майже ігноруємо аутлаєр
-        w_sum   += s["corrected"] * w
-        w_total += w
-
-    weighted_avg = round(w_sum / w_total, 1) if w_total else 0.0
-
-    # Медіана скоригованих (стійка до аутлаєрів)
-    corrected_vals = sorted(s["corrected"] for s in enriched)
-    median_val = _median(corrected_vals)
-
-    # Фінал: зважений + медіана
-    final     = round((weighted_avg + median_val) / 2, 1)
-    final_int = round(final)
-
-    # Довіра: якщо є аутлаєр — знижуємо; якщо всі збігаються — підвищуємо
-    max_spread = max(s["corrected"] for s in enriched) - min(s["corrected"] for s in enriched)
-    n_outliers = sum(1 for s in enriched if s.get("outlier"))
-    if n_outliers > 0:
-        confidence = "⚠️ низька (аутлаєр)"
-    elif max_spread <= 0.5:
-        confidence = "🟢 висока (всі збігаються)"
-    elif max_spread <= 1.5:
-        confidence = "🟡 середня"
-    else:
-        confidence = "🟠 помірна (розкид)"
-
-    return {
-        "sources":      enriched,
-        "weighted_avg": weighted_avg,
-        "median":       median_val,
-        "final_temp":   final,
-        "final_int":    final_int,
-        "month":        month,
-        "max_spread":   round(max_spread, 1),
-        "confidence":   confidence,
-        "n_outliers":   n_outliers,
-    }
+        w = 0.05 if s.get("outlier") else SOURCE_WEIGHTS.get(s["source"], 0.30)
+        w_sum += s["corrected"] * w; w_tot += w
+    weighted = round(w_sum / w_tot, 1) if w_tot else 0.0
+    vals     = sorted(s["corrected"] for s in enriched)
+    median   = _median(vals)
+    final    = round((weighted + median) / 2, 1)
+    spread   = max(vals) - min(vals) if vals else 0
+    n_out    = sum(1 for s in enriched if s.get("outlier"))
+    if n_out:          confidence = "⚠️ низька (аутлаєр)"
+    elif spread <= 0.5: confidence = "🟢 висока"
+    elif spread <= 1.5: confidence = "🟡 середня"
+    else:               confidence = "🟠 помірна"
+    return {"sources": enriched, "weighted_avg": weighted, "median": median,
+            "final_temp": final, "final_int": round(final), "month": month,
+            "max_spread": round(spread, 1), "confidence": confidence}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  POLYMARKET API
+#  POLYMARKET
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_slug(dt: datetime) -> str:
-    return (
-        f"highest-temperature-in-london-on-"
-        f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
-    )
+    return f"highest-temperature-in-london-on-{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
 
 
 def get_polymarket_data(dt: datetime) -> tuple[dict | None, list, str]:
     slug = build_slug(dt)
     link = f"https://polymarket.com/event/{slug}"
     data = _safe_get("https://gamma-api.polymarket.com/events", params={"slug": slug})
-    if not data or not isinstance(data, list) or not data:
-        return None, [], link
+    if not data or not isinstance(data, list) or not data: return None, [], link
     return data[0], data[0].get("markets", []), link
 
 
-def _normalize_temp_label(raw_label: str) -> str:
-    """
-    Нормалізує label до короткого формату.
-    Polymarket повертає або короткий "17°C" або довгий
-    "Will the highest temperature in London be 17°C on April 29?"
-    """
-    if re.match(r"^\d+\s*°C(\s+(or\s+(below|higher)))?$", raw_label.strip(), re.I):
-        return raw_label.strip()
-    m = re.search(r"(\d+)\s*°C\s+or\s+(below|higher)", raw_label, re.I)
-    if m:
-        return f"{m.group(1)}°C or {m.group(2).lower()}"
-    m = re.search(r"(\d+)\s*°C", raw_label)
-    if m:
-        return f"{m.group(1)}°C"
-    return raw_label.strip()
+def _normalize_temp_label(raw: str) -> str:
+    if re.match(r"^\d+\s*°C(\s+(or\s+(below|higher)))?$", raw.strip(), re.I): return raw.strip()
+    m = re.search(r"(\d+)\s*°C\s+or\s+(below|higher)", raw, re.I)
+    if m: return f"{m.group(1)}°C or {m.group(2).lower()}"
+    m = re.search(r"(\d+)\s*°C", raw)
+    if m: return f"{m.group(1)}°C"
+    return raw.strip()
 
 
 def parse_all_outcomes(markets: list) -> dict:
-    """
-    {temperature_label: yes_probability_%}
-    Label нормалізується до короткого формату: "17°C", "16°C or below".
-    outcomePrices — JSON-рядок "[\"0.32\",\"0.68\"]", prices[0] = YES.
-    """
     result = {}
     for m in markets:
         raw_label = m.get("question", "").strip()
         if not raw_label:
             outs = m.get("outcomes", "[]")
             if isinstance(outs, str):
-                try:
-                    outs = json.loads(outs)
-                except Exception:
-                    outs = []
+                try: outs = json.loads(outs)
+                except: outs = []
             raw_label = outs[0] if outs else "Unknown"
-
-        label = _normalize_temp_label(raw_label)
-
+        label      = _normalize_temp_label(raw_label)
         prices_raw = m.get("outcomePrices", "[]")
         if isinstance(prices_raw, str):
-            try:
-                prices = json.loads(prices_raw)
-            except Exception:
-                prices = []
-        else:
-            prices = prices_raw
-
+            try: prices = json.loads(prices_raw)
+            except: prices = []
+        else: prices = prices_raw
         if prices:
-            try:
-                result[label] = round(float(prices[0]) * 100, 1)
-            except Exception:
-                result[label] = 0.0
+            try: result[label] = round(float(prices[0]) * 100, 1)
+            except: result[label] = 0.0
     return result
-
 
 
 def find_outcome_for_temp(outcomes: dict, temp: int) -> tuple[str | None, float | None]:
     exact = f"{temp}°C"
-    if exact in outcomes:
-        return exact, outcomes[exact]
+    if exact in outcomes: return exact, outcomes[exact]
     for lbl, pct in outcomes.items():
         m = re.match(r"(\d+)\s*°C\s+or\s+below$", lbl, re.I)
-        if m and temp <= int(m.group(1)):
-            return lbl, pct
+        if m and temp <= int(m.group(1)): return lbl, pct
         m = re.match(r"(\d+)\s*°C\s+or\s+higher$", lbl, re.I)
-        if m and temp >= int(m.group(1)):
-            return lbl, pct
+        if m and temp >= int(m.group(1)): return lbl, pct
     best_lbl, best_pct, best_d = None, None, 999
     for lbl, pct in outcomes.items():
         m = re.match(r"(\d+)", lbl)
         if m:
             d = abs(int(m.group(1)) - temp)
-            if d < best_d:
-                best_d, best_lbl, best_pct = d, lbl, pct
+            if d < best_d: best_d, best_lbl, best_pct = d, lbl, pct
     return best_lbl, best_pct
 
 
 def polymarket_consensus(outcomes: dict, forecast_temp: int) -> str:
-    """
-    Порівнює прогноз бота з ринковим консенсусом Polymarket.
-    Ринковий консенсус = температура з найвищою ймовірністю.
-    """
-    if not outcomes:
-        return ""
+    if not outcomes: return ""
     top_lbl, top_pct = max(outcomes.items(), key=lambda x: x[1])
     m = re.search(r"(\d+)", top_lbl)
-    if not m:
-        return ""
-    market_temp = int(m.group(1))
-    diff = forecast_temp - market_temp
-
-    if diff == 0:
-        return f"✅ Прогноз збігається з ринком ({market_temp}°C @ {top_pct}%)"
-    elif abs(diff) == 1:
-        return (
-            f"🟡 Прогноз {forecast_temp}°C, ринок ставить на {market_temp}°C @ {top_pct}%"
-            f" (різниця 1°C — в межах норми)"
-        )
+    if not m: return ""
+    mt = int(m.group(1)); diff = forecast_temp - mt
+    if diff == 0:     return f"✅ Прогноз збігається з ринком ({mt}°C @ {top_pct}%)"
+    elif abs(diff)==1: return f"🟡 Прогноз {forecast_temp}°C, ринок — {mt}°C @ {top_pct}% (1°C)"
     else:
-        direction = "вище" if diff > 0 else "нижче"
-        return (
-            f"⚠️ Прогноз {forecast_temp}°C, ринок ставить на {market_temp}°C @ {top_pct}%"
-            f" (прогноз на {abs(diff)}°C {direction} — перевір джерела!)"
-        )
+        d = "вище" if diff > 0 else "нижче"
+        return f"⚠️ Прогноз {forecast_temp}°C, ринок — {mt}°C @ {top_pct}% ({abs(diff)}°C {d})"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -586,258 +455,286 @@ def parse_target_date(args: list) -> tuple[datetime | None, str | None]:
             try:
                 day, month, year = ext(m)
                 dt = datetime(year, month, day)
-                if raw.count(".") == 1 and dt.date() < now.date():
-                    dt = dt.replace(year=year + 1)
+                if raw.count(".") == 1 and dt.date() < now.date(): dt = dt.replace(year=year+1)
                 ahead = (dt.date() - now.date()).days
-                if ahead < 0:
-                    return None, f"❌ Дата {dt.strftime('%d.%m.%Y')} вже минула."
-                if ahead > 15:
-                    return None, "❌ Прогноз доступний максимум на 15 днів вперед."
+                if ahead < 0:  return None, f"❌ Дата {dt.strftime('%d.%m.%Y')} вже минула."
+                if ahead > 15: return None, "❌ Прогноз максимум на 15 днів."
                 return dt, None
-            except ValueError as exc:
-                return None, f"❌ Некоректна дата `{raw}`: {exc}"
-    return None, (
-        f"❌ Не розпізнав дату: `{raw}`\n"
-        "Формат: `DD.MM` або `DD.MM.YYYY`"
-    )
+            except ValueError as e: return None, f"❌ Дата `{raw}`: {e}"
+    return None, f"❌ Не розпізнав: `{raw}`. Формат: DD.MM або DD.MM.YYYY"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MONITORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+monitoring: dict[str, dict] = {}
+
+
+def _date_key(dt: datetime) -> str: return dt.strftime("%Y-%m-%d")
+
+
+def _days_label(dt: datetime) -> str:
+    d = (dt.date() - datetime.utcnow().date()).days
+    return {0:" (сьогодні)",1:" (завтра)",2:" (після завтра)"}.get(d, f" (через {d} дн.)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FORMATTERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _days_label(dt: datetime) -> str:
-    d = (dt.date() - datetime.utcnow().date()).days
-    return {0: " (сьогодні)", 1: " (завтра)", 2: " (після завтра)"}.get(
-        d, f" (через {d} дн.)"
-    )
-
-
 def fmt_weather(dt: datetime, fc: dict) -> str:
-    lines = [
-        f"🌡 *Прогноз EGLC — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
-        "*3 джерела → max°C → EGLC поправка:*",
-    ]
+    lines = [f"🌡 *Прогноз EGLC — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
+             "*3 моделі → погодинний max → wx поправка → EGLC bias:*"]
     for s in fc["sources"]:
-        outlier_mark = f" ⚠️ аутлаєр (Δ{s['outlier_delta']}°C)" if s.get("outlier") else ""
+        out = f" ⚠️ аутлаєр Δ{s['outlier_delta']}°C" if s.get("outlier") else ""
         lines.append(
-            f"  ▸ *{s['source']}*: {s['temp_max']}°C"
-            f" {s['bias']:+.1f}°C → *{s['corrected']}°C*{outlier_mark}"
+            f"  ▸ *{s['source']}*: {s['temp_max']:.1f}°C"
+            f" ☁️{s['cloud']:.0f}% 💨{s['wind']:.0f}"
+            f" → wx:{s['wx_corrected']:.1f} +{s['bias']:+.1f} → *{s['corrected']:.1f}°C*{out}"
         )
-        lines.append(f"     _↳ {s['accuracy']}_")
-
+        lines.append(f"     _{s['wx_note']} │ {s['accuracy']}_")
     lines.append(
-        f"\n📍 *Прогноз EGLC:* *{fc['final_temp']}°C* → округлено *{fc['final_int']}°C*"
+        f"\n📍 *EGLC: {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
     )
     lines.append(
-        f"   _(зважений: {fc['weighted_avg']}°C │ медіана: {fc['median']}°C"
-        f" │ розкид: {fc['max_spread']}°C)_"
+        f"   _(зваж: {fc['weighted_avg']:.1f} │ медіана: {fc['median']:.1f}"
+        f" │ розкид: {fc['max_spread']:.1f}°C)_"
     )
     lines.append(f"   _Довіра: {fc['confidence']}_")
     return "\n".join(lines)
 
 
-def fmt_polymarket(
-    dt: datetime,
-    outcomes: dict,
-    tgt_lbl: str | None,
-    tgt_pct: float | None,
-    link: str,
-    forecast_temp: int | None = None,
-) -> str:
+def fmt_polymarket(dt: datetime, outcomes: dict,
+                   tgt_lbl: str | None, tgt_pct: float | None,
+                   link: str, forecast_temp: int | None = None,
+                   trend: dict | None = None) -> str:
     lines = ["\n📊 *Polymarket — Highest Temp London:*"]
     if outcomes:
-        top5 = sorted(outcomes.items(), key=lambda x: -x[1])[:5]
-        for lbl, pct in top5:
+        for lbl, pct in sorted(outcomes.items(), key=lambda x: -x[1])[:5]:
             mark = " ◀️ *прогноз*" if lbl == tgt_lbl else ""
             lines.append(f"  `{lbl}`: {pct}%{mark}")
-
-        if tgt_lbl:
-            lines.append(f"\n🎯 Outcome: `{tgt_lbl}` = *{tgt_pct}%*")
-            if tgt_pct is not None:
-                if tgt_pct < 20:
-                    lines.append("🟢 *< 20% — ДУЖЕ вигідно! Сильний сигнал купівлі*")
-                elif tgt_pct < 38:
-                    _m = re.search(r"(\d+)", tgt_lbl)
-                    _num = _m.group(1) if _m else "??"
-                    lines.append(f"🟢 *< 38% — Сигнал BUY* → `/buy {_num}`")
-                elif tgt_pct < 50:
-                    lines.append("⏳ *38–50% — тримати / чекати*")
-                elif tgt_pct < 65:
-                    lines.append("🔴 *≥ 50% — розглянути фіксацію прибутку*")
-                else:
-                    lines.append("🔴 *≥ 65% — ринок переоцінює, ризик зростає*")
-
-        # Консенсус прогнозу з ринком
-        if forecast_temp is not None:
-            consensus = polymarket_consensus(outcomes, forecast_temp)
-            if consensus:
-                lines.append(f"\n_{consensus}_")
+        if tgt_lbl and tgt_pct is not None:
+            lines.append(f"\n🎯 `{tgt_lbl}` = *{tgt_pct}%*")
+            mn = re.search(r"(\d+)", tgt_lbl)
+            num = mn.group(1) if mn else "??"
+            if tgt_pct < 20:   lines.append("🟢 *ДУЖЕ вигідно — сильний BUY!*")
+            elif tgt_pct < 38: lines.append(f"🟢 *BUY сигнал < 38%* → `/buy {num}`")
+            elif tgt_pct < 50: lines.append("⏳ *38–50% — тримати*")
+            elif tgt_pct < 65: lines.append("🔴 *≥ 50% — розглянути продаж*")
+            else:               lines.append("🔴 *≥ 65% — ринок переоцінює*")
+        if trend:
+            arrow = "📈" if trend["delta"] > 0 else ("📉" if trend["delta"] < 0 else "➡️")
+            lines.append(
+                f"\n{arrow} *Тренд {trend['minutes']}хв:* {trend['first']}% → {trend['last']}%"
+                f" ({trend['delta']:+.1f}%)"
+            )
+            lines.append(f"   `{trend['spark']}`")
+            if abs(trend["momentum"]) >= MOMENTUM_THRESHOLD:
+                mo = "🚀" if trend["momentum"] > 0 else "💥"
+                lines.append(f"   {mo} *Momentum 30хв: {trend['momentum']:+.1f}%*")
+        if forecast_temp:
+            c = polymarket_consensus(outcomes, forecast_temp)
+            if c: lines.append(f"\n_{c}_")
     else:
         lines.append("  ⚠️ Ринок не знайдено або ще не відкрито")
-
     lines.append(f"\n🔗 {link}")
     return "\n".join(lines)
 
 
-def fmt_buy_hint(tgt_lbl: str | None, dt: datetime | None = None) -> str:
-    if not tgt_lbl:
-        return ""
-    m = re.search(r"(\d+)", tgt_lbl)
-    num = m.group(1) if m else "??"
-    date_part = f" {dt.strftime('%d.%m')}" if dt else ""
-    return f"\n\n💡 Після купівлі: `/buy {num}{date_part}`"
+# ══════════════════════════════════════════════════════════════════════════════
+#  KEYBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("🔍 Прогноз завтра"),   KeyboardButton("📅 Прогноз 2 дні")],
+        [KeyboardButton("📊 Polymarket завтра"), KeyboardButton("📈 Мої позиції")],
+        [KeyboardButton("🌤 Погода завтра"),     KeyboardButton("📉 Тренд цін")],
+        [KeyboardButton("📋 Брифінг"),           KeyboardButton("❓ Допомога")],
+    ], resize_keyboard=True)
+
+
+def positions_keyboard(positions: dict) -> InlineKeyboardMarkup:
+    buttons = []
+    for dk, state in positions.items():
+        dt  = state["target_date"]
+        lbl = state["outcome_label"]
+        buttons.append([
+            InlineKeyboardButton(f"🔴 Закрити {dt.strftime('%d.%m')} {lbl}", callback_data=f"sell_{dk}"),
+            InlineKeyboardButton(f"📈 Тренд {dt.strftime('%d.%m')}", callback_data=f"trend_{dk}"),
+        ])
+    buttons.append([InlineKeyboardButton("🔄 Оновити", callback_data="refresh_positions")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MULTI-DATE MONITORING STATE
-# ══════════════════════════════════════════════════════════════════════════════
-# monitoring[date_key] = {active, target_date, outcome_label, temp_int,
-#                         buy_pct, alerted, poly_link}
-monitoring: dict[str, dict] = {}
-
-
-def _date_key(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
-
-
-def _get_or_none(date_key: str) -> dict | None:
-    m = monitoring.get(date_key)
-    return m if m and m.get("active") else None
-
-
-async def _send_alert(
-    bot: Bot, level: int, label: str, pct: float, link: str,
-    date_str: str, buy_pct: float
-) -> None:
-    emoji = {40: "🟡", 50: "🟠", 60: "🔴", 70: "🔴", 80: "🚨", 90: "🚨"}.get(level, "📢")
-    rec   = "🔴 *Час фіксувати прибуток!*" if level >= 50 else "⏳ Тримаємо далі"
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        parse_mode="Markdown",
-        text=(
-            f"{emoji} *АЛЕРТ {level}% — {date_str}*\n\n"
-            f"Outcome `{label}` → *{pct}%*\n"
-            f"_(куплено @ {buy_pct}%)_\n\n"
-            f"{rec}\n\n"
-            f"🔗 {link}\n"
-            f"Закрити: /sell {date_str}"
-        ),
-    )
-
-
-async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кожні 10 хв перевіряє всі активні позиції."""
-    now_date = datetime.utcnow().date()
-    to_close = []
-
-    for dk, state in list(monitoring.items()):
-        if not state.get("active"):
-            continue
-
-        dt = state["target_date"]
-
-        # Дата минула — закриваємо
-        if dt.date() < now_date:
-            to_close.append(dk)
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"ℹ️ Моніторинг {dt.strftime('%d.%m.%Y')} завершено — дата минула.",
-            )
-            continue
-
-        _, markets, link = get_polymarket_data(dt)
-        if not markets:
-            continue
-
-        outcomes    = parse_all_outcomes(markets)
-        current_pct = outcomes.get(state["outcome_label"])
-        if current_pct is None:
-            continue
-
-        logger.info("Monitor %s: %s @ %.1f%%", dk, state["outcome_label"], current_pct)
-
-        for level in ALERT_LEVELS:
-            if current_pct >= level and level not in state["alerted"]:
-                state["alerted"].append(level)
-                await _send_alert(
-                    context.bot, level, state["outcome_label"],
-                    current_pct, link, dt.strftime("%d.%m"), state["buy_pct"]
-                )
-
-    for dk in to_close:
-        monitoring[dk]["active"] = False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  AUTO BUY/MORNING SIGNAL
+#  CORE REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _send_auto_check(bot: Bot, dt: datetime, label: str = "📅 Авто-звіт") -> None:
-    """Надсилає повний звіт із BUY-сигналом якщо outcome < 38%."""
+async def _send_full_report(bot: Bot, dt: datetime,
+                             chat_id: str | int, label: str = "🔍") -> None:
     fc = compute_forecast(dt)
     if "error" in fc:
-        await bot.send_message(chat_id=CHAT_ID, text=f"⚠️ {fc['error']}")
-        return
-
+        await bot.send_message(chat_id=chat_id, text=f"⚠️ {fc['error']}"); return
     _, markets, link = get_polymarket_data(dt)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
-
-    msg = (
-        f"*{label} — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n\n"
-        + fmt_weather(dt, fc)
-        + "\n"
-        + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"])
-        + fmt_buy_hint(tgt_lbl, dt)
-    )
-
-    # Якщо сигнал BUY — виділяємо
-    if tgt_pct is not None and tgt_pct < BUY_SIGNAL_MAX_PCT:
-        m = re.search(r"(\d+)", tgt_lbl or "")
-        num = m.group(1) if m else "??"
-        msg += (
-            f"\n\n{'='*30}\n"
-            f"🟢 *BUY СИГНАЛ!*\n"
-            f"Outcome `{tgt_lbl}` = {tgt_pct}% < {BUY_SIGNAL_MAX_PCT}%\n"
-            f"Після купівлі: `/buy {num} {dt.strftime('%d.%m')}`"
-        )
-
-    await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    dk    = _date_key(dt)
+    trend = get_trend(dk, tgt_lbl) if tgt_lbl else None
+    msg = (f"*{label} — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n\n"
+           + fmt_weather(dt, fc) + "\n"
+           + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"], trend))
+    if tgt_pct is not None and tgt_pct < BUY_MAX_PCT:
+        mn  = re.search(r"(\d+)", tgt_lbl or "")
+        num = mn.group(1) if mn else "??"
+        msg += (f"\n\n{'='*26}\n🟢 *BUY СИГНАЛ!* `{tgt_lbl}` = {tgt_pct}%\n"
+                f"`/buy {num} {dt.strftime('%d.%m')}`")
+    await bot.send_message(chat_id=chat_id, text=msg,
+                           parse_mode="Markdown", reply_markup=main_keyboard())
 
 
-async def daily_job_14(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """14:00 Kyiv — прогноз на завтра."""
-    tomorrow = (datetime.utcnow() + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    await _send_auto_check(context.bot, tomorrow, "⏰ 14:00 Kyiv")
+# ══════════════════════════════════════════════════════════════════════════════
+#  MONITOR JOB — кожні 2 хв
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now_date = datetime.utcnow().date()
+    for dk, state in list(monitoring.items()):
+        if not state.get("active"): continue
+        dt = state["target_date"]
+        if dt.date() < now_date:
+            state["active"] = False
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"ℹ️ Моніторинг {dt.strftime('%d.%m.%Y')} завершено."); continue
+        _, markets, link = get_polymarket_data(dt)
+        if not markets: continue
+        outcomes    = parse_all_outcomes(markets)
+        label       = state["outcome_label"]
+        current_pct = outcomes.get(label)
+        if current_pct is None: continue
+
+        record_price(dk, label, current_pct)
+        logger.info("Monitor %s: %s @ %.1f%%", dk, label, current_pct)
+
+        # Стандартні алерти рівнів
+        for level in ALERT_LEVELS:
+            if current_pct >= level and level not in state["alerted"]:
+                state["alerted"].append(level)
+                emoji = {40:"🟡",50:"🟠",60:"🔴",70:"🔴",80:"🚨",90:"🚨"}.get(level,"📢")
+                rec   = "🔴 *Фіксуй прибуток!*" if level >= 50 else "⏳ Тримаємо"
+                await context.bot.send_message(
+                    chat_id=CHAT_ID, parse_mode="Markdown",
+                    text=(f"{emoji} *АЛЕРТ {level}% — {dt.strftime('%d.%m')}*\n\n"
+                          f"`{label}` → *{current_pct}%*\n_(куплено @ {state['buy_pct']}%)_\n\n"
+                          f"{rec}\n🔗 {link}"))
+
+        # Тейк-профіт
+        tp = state.get("take_profit")
+        if tp and current_pct >= tp and not state.get("tp_alerted"):
+            state["tp_alerted"] = True
+            await context.bot.send_message(
+                chat_id=CHAT_ID, parse_mode="Markdown",
+                text=(f"🎯 *ТЕЙК-ПРОФІТ {tp}% — {dt.strftime('%d.%m')}*\n\n"
+                      f"`{label}` → *{current_pct}%*\n_(куплено @ {state['buy_pct']}%)_\n\n"
+                      f"💰 Рекомендую продати!\n🔗 {link}"))
+
+        # Стоп-лос
+        sl = state.get("stop_loss")
+        if sl and current_pct <= sl and not state.get("sl_alerted"):
+            state["sl_alerted"] = True
+            await context.bot.send_message(
+                chat_id=CHAT_ID, parse_mode="Markdown",
+                text=(f"🛑 *СТОП-ЛОС {sl}% — {dt.strftime('%d.%m')}*\n\n"
+                      f"`{label}` → *{current_pct}%* ≤ {sl}%\n_(куплено @ {state['buy_pct']}%)_\n\n"
+                      f"⚠️ Розглянь продаж щоб обмежити збиток!\n🔗 {link}"))
+
+        # Momentum
+        trend = get_trend(dk, label, 30)
+        if trend and abs(trend["momentum"]) >= MOMENTUM_THRESHOLD:
+            mom_key = f"mom_{int(trend['momentum'])}"
+            if mom_key not in state.get("alerted_mom", []):
+                state.setdefault("alerted_mom", []).append(mom_key)
+                arrow = "🚀" if trend["momentum"] > 0 else "💥"
+                await context.bot.send_message(
+                    chat_id=CHAT_ID, parse_mode="Markdown",
+                    text=(f"{arrow} *Різка зміна — {dt.strftime('%d.%m')}*\n\n"
+                          f"`{label}`: {trend['momentum']:+.1f}% за 30хв\n"
+                          f"Зараз: *{current_pct}%*\n🔗 {link}"))
 
 
-async def daily_job_8(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """08:00 Kyiv — уточнений ранковий прогноз на сьогодні і завтра."""
-    today    = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow = today + timedelta(days=1)
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCHEDULED JOBS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Завтра — основне
-    await _send_auto_check(context.bot, tomorrow, "🌅 Ранковий прогноз")
+async def job_morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """07:30 Kyiv."""
+    now      = datetime.utcnow()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    await _send_full_report(context.bot, tomorrow, CHAT_ID, "🌅 Ранковий брифінг")
 
-    # Якщо є активні позиції — надіслати поточні ціни
     active = {dk: s for dk, s in monitoring.items() if s.get("active")}
     if active:
-        lines = ["📊 *Поточні ціни по позиціях:*"]
-        for dk, state in active.items():
-            dt = state["target_date"]
-            _, markets, link = get_polymarket_data(dt)
-            outcomes    = parse_all_outcomes(markets) if markets else {}
-            current_pct = outcomes.get(state["outcome_label"], "?")
-            lines.append(
-                f"  {dt.strftime('%d.%m')}: `{state['outcome_label']}` "
-                f"куп. {state['buy_pct']}% → зараз {current_pct}%"
-            )
+        lines = ["📊 *Активні позиції:*"]
+        for dk, state in sorted(active.items()):
+            dt  = state["target_date"]
+            lbl = state["outcome_label"]
+            _, markets, _ = get_polymarket_data(dt)
+            outcomes = parse_all_outcomes(markets) if markets else {}
+            cur  = outcomes.get(lbl, "?")
+            buy  = state["buy_pct"]
+            roi_str = ""
+            if isinstance(cur, float) and isinstance(buy, float) and buy > 0:
+                roi = round((cur / buy - 1) * 100, 1)
+                roi_str = f" │ ROI {roi:+.1f}%"
+            t = get_trend(dk, lbl, 60)
+            t_str = f" │ {t['delta']:+.1f}% /1г" if t else ""
+            lines.append(f"  {dt.strftime('%d.%m')} `{lbl}`: {buy}% → *{cur}%*{roi_str}{t_str}")
+        await context.bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode="Markdown")
+
+    # Нагадування записати факт
+    yesterday = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    _, y_mkts, _ = get_polymarket_data(yesterday)
+    if y_mkts:
         await context.bot.send_message(
-            chat_id=CHAT_ID, text="\n".join(lines), parse_mode="Markdown"
-        )
+            chat_id=CHAT_ID, parse_mode="Markdown",
+            text=(f"📝 Вчора {yesterday.strftime('%d.%m')} був ринок.\n"
+                  f"Запиши факт для навчання:\n"
+                  f"`/actual ECMWF <прогноз> <факт> {now.month}`\n"
+                  f"`/actual DWD ICON <прогноз> <факт> {now.month}`\n"
+                  f"`/actual UK Met Office <прогноз> <факт> {now.month}`"))
+
+
+async def job_daily_14(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """14:00 Kyiv."""
+    tomorrow = (datetime.utcnow() + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    await _send_full_report(context.bot, tomorrow, CHAT_ID, "⏰ 14:00 Kyiv")
+
+
+async def job_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """09:00 Kyiv — скан нових ринків."""
+    now   = datetime.utcnow()
+    found = []
+    for days_ahead in range(1, 5):
+        dt = (now + timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
+        event, markets, link = get_polymarket_data(dt)
+        if not event or not markets: continue
+        outcomes    = parse_all_outcomes(markets)
+        buy_signals = [(lbl, pct) for lbl, pct in outcomes.items() if pct < BUY_MAX_PCT]
+        if buy_signals:
+            best_lbl, best_pct = min(buy_signals, key=lambda x: x[1])
+            mn  = re.search(r"(\d+)", best_lbl)
+            num = mn.group(1) if mn else "??"
+            found.append(
+                f"📅 *{dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n"
+                f"  🟢 `{best_lbl}` = {best_pct}%\n"
+                f"  `/buy {num} {dt.strftime('%d.%m')}`\n  🔗 {link}")
+    if found:
+        await context.bot.send_message(
+            chat_id=CHAT_ID, parse_mode="Markdown",
+            text="🔍 *Авто-скан — BUY сигнали:*\n\n" + "\n\n".join(found))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -847,381 +744,342 @@ async def daily_job_8(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     await update.message.reply_text(
-        f"🤖 *London EGLC Temp Bot v3*\n"
-        f"chat\\_id: `{cid}`\n\n"
-        f"*Команди:*\n"
-        f"`/check \\[DD\\.MM\\]` — прогноз \\+ Polymarket\n"
-        f"`/check2` — завтра \\+ після завтра разом\n"
-        f"`/poll \\[DD\\.MM\\]` — лише Polymarket\n"
-        f"`/forecast \\[DD\\.MM\\]` — лише погода\n"
-        f"`/buy <temp> \\[DD\\.MM\\]` — відкрити позицію\n"
-        f"`/sell \\[DD\\.MM|all\\]` — закрити позицію\n"
-        f"`/positions` — всі активні позиції\n"
-        f"`/status \\[DD\\.MM\\]` — деталі позиції\n"
-        f"`/history` — точність джерел\n"
-        f"`/actual <src> <pred> <fact> \\[m\\]` — записати факт\n\n"
-        f"⏰ Авто\\-звіти: *08:00* і *14:00* Київ\n"
+        f"🤖 *London EGLC Temp Bot v4*\nchat\\_id: `{cid}`\n\n"
+        f"Використовуй *кнопки* або команди:\n\n"
+        f"*Прогноз:* `/check` `/check2` `/forecast` `/poll`\n"
+        f"*Торгівля:*\n"
+        f"`/buy <temp> [DD\\.MM] [\\-\\-stop X] [\\-\\-tp Y]`\n"
+        f"  напр: `/buy 17 29\\.04 \\-\\-stop 20 \\-\\-tp 65`\n"
+        f"`/sell [DD\\.MM|all]` `/positions` `/trend`\n"
+        f"*Навчання:* `/actual` `/history`\n"
+        f"`/briefing` — ручний брифінг\n\n"
+        f"⏰ Авто: 07:30 брифінг │ 09:00 скан │ 14:00 звіт\n"
         f"🔔 Алерти: 40→50→60→70→80→90%\n"
-        f"🟢 BUY сигнал при outcome < {BUY_SIGNAL_MAX_PCT}%\n"
-        f"🔴 SELL сигнал при outcome ≥ {SELL_SIGNAL_MIN_PCT}%",
-        parse_mode="MarkdownV2",
-    )
+        f"🛑 Стоп\\-лос │ 🎯 Тейк\\-профіт │ 🚀 Momentum",
+        parse_mode="MarkdownV2", reply_markup=main_keyboard())
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dt, err = parse_target_date(context.args)
-    if err:
-        await update.message.reply_text(err, parse_mode="Markdown")
-        return
+    if err: await update.message.reply_text(err, parse_mode="Markdown"); return
     await update.message.reply_text(
-        f"⏳ Збираю дані для *{dt.strftime('%d.%m.%Y')}*…", parse_mode="Markdown"
-    )
-    await _send_auto_check(context.bot, dt, "🔍 Запит")
+        f"⏳ *{dt.strftime('%d.%m.%Y')}*…", parse_mode="Markdown")
+    await _send_full_report(context.bot, dt, update.effective_chat.id, "🔍 Запит")
 
 
 async def cmd_check2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Прогноз одразу для завтра і після завтра."""
     now = datetime.utcnow()
-    tomorrow  = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    day_after = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
-
     await update.message.reply_text("⏳ Збираю дані для 2 днів…")
-    for dt in (tomorrow, day_after):
-        await _send_auto_check(context.bot, dt, "🔍 Запит")
+    for days in (1, 2):
+        dt = (now + timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await _send_full_report(context.bot, dt, update.effective_chat.id, "🔍 Запит")
 
 
 async def cmd_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dt, err = parse_target_date(context.args)
-    if err:
-        await update.message.reply_text(err, parse_mode="Markdown")
-        return
+    if err: await update.message.reply_text(err, parse_mode="Markdown"); return
     fc = compute_forecast(dt)
-    if "error" in fc:
-        await update.message.reply_text(f"⚠️ {fc['error']}")
-        return
+    if "error" in fc: await update.message.reply_text(f"⚠️ {fc['error']}"); return
     _, markets, link = get_polymarket_data(dt)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
-    header = (
-        f"📡 *Polymarket — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n"
-        f"🎯 Прогноз EGLC: *{fc['final_int']}°C* ({fc['confidence']})\n"
-    )
+    dk = _date_key(dt); trend = get_trend(dk, tgt_lbl) if tgt_lbl else None
     await update.message.reply_text(
-        header + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"]),
-        parse_mode="Markdown",
-    )
+        f"📡 *{dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n"
+        f"🎯 Прогноз: *{fc['final_int']}°C* ({fc['confidence']})\n"
+        + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"], trend),
+        parse_mode="Markdown", reply_markup=main_keyboard())
 
 
 async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dt, err = parse_target_date(context.args)
-    if err:
-        await update.message.reply_text(err, parse_mode="Markdown")
-        return
-    await update.message.reply_text(
-        f"🌤 Завантажую прогноз для *{dt.strftime('%d.%m.%Y')}*…", parse_mode="Markdown"
-    )
+    if err: await update.message.reply_text(err, parse_mode="Markdown"); return
+    await update.message.reply_text(f"🌤 *{dt.strftime('%d.%m.%Y')}*…", parse_mode="Markdown")
     fc = compute_forecast(dt)
-    if "error" in fc:
-        await update.message.reply_text(f"⚠️ {fc['error']}")
+    if "error" in fc: await update.message.reply_text(f"⚠️ {fc['error']}"); return
+    await update.message.reply_text(fmt_weather(dt, fc), parse_mode="Markdown",
+                                    reply_markup=main_keyboard())
+
+
+async def cmd_trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    dt, err = parse_target_date(context.args)
+    if err: await update.message.reply_text(err, parse_mode="Markdown"); return
+    dk    = _date_key(dt)
+    state = monitoring.get(dk)
+    if not state or not state.get("active"):
+        # Показуємо тренди всіх активних позицій
+        active = {k: s for k, s in monitoring.items() if s.get("active")}
+        if not active:
+            await update.message.reply_text("⚠️ Немає активних позицій."); return
+        for adk, astate in active.items():
+            trend = get_trend(adk, astate["outcome_label"], 180)
+            if not trend: continue
+            arrow = "📈" if trend["delta"] > 0 else "📉"
+            adt   = astate["target_date"]
+            await update.message.reply_text(
+                f"📊 *{adt.strftime('%d.%m')} `{astate['outcome_label']}`*\n"
+                f"{arrow} {trend['first']}% → *{trend['last']}%* ({trend['delta']:+.1f}%)\n"
+                f"`{trend['spark']}`",
+                parse_mode="Markdown")
         return
-    await update.message.reply_text(fmt_weather(dt, fc), parse_mode="Markdown")
+    trend = get_trend(dk, state["outcome_label"], 180)
+    if not trend: await update.message.reply_text("📊 Мало даних (< 2 точок)."); return
+    arrow = "📈" if trend["delta"] > 0 else "📉"
+    mo_str = ""
+    if abs(trend["momentum"]) >= MOMENTUM_THRESHOLD:
+        mo = "🚀" if trend["momentum"] > 0 else "💥"
+        mo_str = f"\n{mo} *Momentum 30хв: {trend['momentum']:+.1f}%*"
+    await update.message.reply_text(
+        f"📊 *Тренд {dt.strftime('%d.%m')} `{state['outcome_label']}`*\n\n"
+        f"{arrow} {trend['first']}% → *{trend['last']}%* ({trend['delta']:+.1f}% / {trend['minutes']}хв)\n"
+        f"Точок: {trend['n']}\n\n`{trend['spark']}`{mo_str}",
+        parse_mode="Markdown", reply_markup=main_keyboard())
 
 
 async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /buy <температура> [DD.MM]
-    Відкриває нову позицію для моніторингу.
-    Можна мати кілька позицій на різні дати.
-    """
     if not context.args:
         await update.message.reply_text(
-            "❓ `/buy 17` або `/buy 17 28.04`", parse_mode="Markdown"
-        )
-        return
-    try:
-        temp_int = int(context.args[0])
+            "❓ `/buy <temp> [DD.MM] [--stop X] [--tp Y]`\n"
+            "Приклад: `/buy 17 29.04 --stop 20 --tp 65`",
+            parse_mode="Markdown"); return
+    try: temp_int = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Температура — ціле число. Приклад: `/buy 17`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("❌ Температура — ціле число.", parse_mode="Markdown"); return
 
-    dt, err = parse_target_date(context.args[1:] if len(context.args) > 1 else [])
-    if err:
-        await update.message.reply_text(err, parse_mode="Markdown")
-        return
+    remaining = list(context.args[1:])
+    stop_loss = None; take_profit = None; clean_args = []
+    i = 0
+    while i < len(remaining):
+        if remaining[i] == "--stop" and i+1 < len(remaining):
+            try: stop_loss = float(remaining[i+1]); i += 2; continue
+            except: pass
+        if remaining[i] == "--tp" and i+1 < len(remaining):
+            try: take_profit = float(remaining[i+1]); i += 2; continue
+            except: pass
+        clean_args.append(remaining[i]); i += 1
+
+    dt, err = parse_target_date(clean_args if clean_args else [])
+    if err: await update.message.reply_text(err, parse_mode="Markdown"); return
 
     await update.message.reply_text(
-        f"🔍 Шукаю outcome *{temp_int}°C* на {dt.strftime('%d.%m.%Y')}…",
-        parse_mode="Markdown"
-    )
+        f"🔍 Шукаю *{temp_int}°C* на {dt.strftime('%d.%m.%Y')}…", parse_mode="Markdown")
 
     _, markets, link = get_polymarket_data(dt)
     outcomes = parse_all_outcomes(markets) if markets else {}
     lbl, pct = find_outcome_for_temp(outcomes, temp_int) if outcomes else (None, None)
 
     if not lbl:
-        # Debug: показуємо що реально прийшло з API
-        debug_lines = [f"⚠️ Не знайдено outcome для *{temp_int}°C* на Polymarket.\n"]
+        debug = [f"⚠️ Не знайдено outcome для *{temp_int}°C*.\n"]
         if not markets:
-            debug_lines.append("_API повернув 0 markets — ринок не відкрито або slug невірний_")
+            debug.append("_Ринок не відкрито або slug невірний_")
         else:
-            debug_lines.append(f"_Знайдено {len(markets)} markets. Нормалізовані labels:_")
-            for i, mkt in enumerate(markets[:8]):
-                raw_q = mkt.get("question", "?")[:60]
+            debug.append(f"_Знайдено {len(markets)} markets:_")
+            for i2, mkt in enumerate(markets[:6]):
+                raw_q = mkt.get("question", "?")[:55]
                 norm  = _normalize_temp_label(mkt.get("question", ""))
-                debug_lines.append(f"  `{i+1}. {raw_q}`")
-                debug_lines.append(f"     `→ {norm}`")
-        debug_lines.append(f"\n🔗 {link}")
-        await update.message.reply_text("\n".join(debug_lines), parse_mode="Markdown")
-        return
+                debug.append(f"  `{i2+1}. {raw_q}`\n     `→ {norm}`")
+        debug.append(f"\n🔗 {link}")
+        await update.message.reply_text("\n".join(debug), parse_mode="Markdown"); return
 
     dk = _date_key(dt)
+    if monitoring.get(dk, {}).get("active"):
+        await update.message.reply_text(
+            f"⚠️ Попередня позиція `{monitoring[dk]['outcome_label']}` зупинена.",
+            parse_mode="Markdown")
+
     already = [l for l in ALERT_LEVELS if pct is not None and pct >= l]
     pending = [l for l in ALERT_LEVELS if l not in already]
-
     monitoring[dk] = {
-        "active":        True,
-        "target_date":   dt,
-        "outcome_label": lbl,
-        "temp_int":      temp_int,
-        "buy_pct":       pct,
-        "alerted":       already,
-        "poly_link":     link,
+        "active": True, "target_date": dt, "outcome_label": lbl, "temp_int": temp_int,
+        "buy_pct": pct, "alerted": already, "poly_link": link,
+        "stop_loss": stop_loss, "take_profit": take_profit,
+        "tp_alerted": False, "sl_alerted": False, "alerted_mom": [],
     }
-
-    total_active = sum(1 for s in monitoring.values() if s.get("active"))
-
+    sl_str = f"\n🛑 Стоп-лос: *{stop_loss}%*" if stop_loss else ""
+    tp_str = f"\n🎯 Тейк-профіт: *{take_profit}%*" if take_profit else ""
     await update.message.reply_text(
         f"✅ *Позицію відкрито*\n\n"
         f"📅 {dt.strftime('%d.%m.%Y')}\n"
-        f"🎯 Outcome: `{lbl}`\n"
-        f"💰 Поточна ціна: *{pct}%*\n\n"
-        f"🔔 Наступні алерти: {', '.join(str(l)+'%' for l in pending) or 'всі вже пройдені'}\n"
-        f"📊 Всього активних позицій: {total_active}\n\n"
-        f"🔗 {link}\n"
-        f"Закрити: `/sell {dt.strftime('%d.%m')}`",
-        parse_mode="Markdown",
-    )
+        f"🎯 `{lbl}`\n💰 *{pct}%*{sl_str}{tp_str}\n\n"
+        f"🔔 Алерти: {', '.join(str(l)+'%' for l in pending) or 'всі пройдено'}\n"
+        f"Позицій: {sum(1 for s in monitoring.values() if s.get('active'))}\n\n🔗 {link}",
+        parse_mode="Markdown", reply_markup=main_keyboard())
 
 
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /sell          — закрити єдину активну (або останню)
-    /sell 28.04    — закрити конкретну дату
-    /sell all      — закрити всі
-    """
     active = {dk: s for dk, s in monitoring.items() if s.get("active")}
-
-    if not active:
-        await update.message.reply_text("ℹ️ Немає активних позицій.")
-        return
-
-    # Визначаємо які закривати
+    if not active: await update.message.reply_text("ℹ️ Немає активних позицій."); return
     arg = context.args[0].lower() if context.args else ""
-
     if arg == "all":
         to_close = list(active.keys())
     elif arg:
-        # Спробуємо розпізнати як дату
         dt_parsed, err = parse_target_date(context.args)
         if err or dt_parsed is None:
-            await update.message.reply_text(
-                f"❌ Не розпізнав дату: `{arg}`\n"
-                "Формат: `/sell 28.04` або `/sell all`",
-                parse_mode="Markdown"
-            )
-            return
+            await update.message.reply_text("❌ `/sell DD.MM` або `/sell all`", parse_mode="Markdown"); return
         dk = _date_key(dt_parsed)
         if dk not in active:
-            await update.message.reply_text(
-                f"⚠️ Немає активної позиції на {dt_parsed.strftime('%d.%m.%Y')}.\n"
-                f"Активні: {', '.join(s['target_date'].strftime('%d.%m') for s in active.values())}",
-                parse_mode="Markdown"
-            )
-            return
+            dates = ", ".join(s["target_date"].strftime("%d.%m") for s in active.values())
+            await update.message.reply_text(f"⚠️ Немає позиції. Активні: {dates}"); return
         to_close = [dk]
     else:
-        # Без аргументу — якщо одна позиція, закриваємо її; якщо більше — просимо уточнити
-        if len(active) == 1:
-            to_close = list(active.keys())
+        if len(active) == 1: to_close = list(active.keys())
         else:
             dates = ", ".join(s["target_date"].strftime("%d.%m") for s in active.values())
             await update.message.reply_text(
-                f"❓ Кілька активних позицій: {dates}\n"
-                f"Вкажи дату: `/sell 28.04` або `/sell all`",
-                parse_mode="Markdown"
-            )
-            return
-
-    # Закриваємо і формуємо звіт
+                f"❓ Кілька: {dates}\n`/sell DD.MM` або `/sell all`", parse_mode="Markdown"); return
     lines = []
     for dk in to_close:
-        state = monitoring[dk]
-        dt    = state["target_date"]
-        lbl   = state["outcome_label"]
-        buy   = state["buy_pct"]
-
+        state = monitoring[dk]; dt = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
         _, markets, _ = get_polymarket_data(dt)
-        outcomes    = parse_all_outcomes(markets) if markets else {}
-        current_pct = outcomes.get(lbl)
-
+        outcomes = parse_all_outcomes(markets) if markets else {}
+        cur = outcomes.get(lbl)
         state["active"] = False
-
         profit = ""
-        if isinstance(current_pct, float) and isinstance(buy, float) and buy > 0:
-            roi    = round((current_pct / buy - 1) * 100, 1)
-            profit = f" │ ROI: {roi:+.1f}%"
-
-        lines.append(
-            f"🛑 *{dt.strftime('%d.%m.%Y')}*: `{lbl}`\n"
-            f"   Куп. {buy}% → зараз {current_pct}%{profit}"
-        )
-
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+        if isinstance(cur, float) and isinstance(buy, float) and buy > 0:
+            roi = round((cur / buy - 1) * 100, 1); profit = f" │ ROI: {roi:+.1f}%"
+        lines.append(f"🛑 *{dt.strftime('%d.%m')}* `{lbl}`: {buy}% → {cur}%{profit}")
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown",
+                                    reply_markup=main_keyboard())
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Всі активні позиції з поточними цінами."""
     active = {dk: s for dk, s in monitoring.items() if s.get("active")}
     if not active:
-        await update.message.reply_text(
-            "📊 Немає активних позицій.\n\nВідкрити: `/buy <temp> [DD.MM]`",
-            parse_mode="Markdown"
-        )
-        return
-
+        await update.message.reply_text("📊 Немає позицій.\n`/buy <temp>`",
+                                        parse_mode="Markdown", reply_markup=main_keyboard()); return
     lines = [f"📊 *Активні позиції ({len(active)}):*\n"]
     for dk, state in sorted(active.items()):
-        dt  = state["target_date"]
-        lbl = state["outcome_label"]
-        buy = state["buy_pct"]
-
+        dt = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
         _, markets, link = get_polymarket_data(dt)
-        outcomes    = parse_all_outcomes(markets) if markets else {}
-        current_pct = outcomes.get(lbl, "?")
-
-        alerted = state["alerted"]
-        pending = [l for l in ALERT_LEVELS if l not in alerted]
-
-        profit = ""
-        if isinstance(current_pct, float) and isinstance(buy, float) and buy > 0:
-            roi    = round((current_pct / buy - 1) * 100, 1)
-            sign   = "📈" if roi >= 0 else "📉"
-            profit = f" {sign} {roi:+.1f}%"
-
+        outcomes = parse_all_outcomes(markets) if markets else {}
+        cur = outcomes.get(lbl, "?"); trend = get_trend(dk, lbl, 60)
+        roi_str = ""
+        if isinstance(cur, float) and isinstance(buy, float) and buy > 0:
+            roi = round((cur / buy - 1) * 100, 1)
+            roi_str = f" │ {'📈' if roi >= 0 else '📉'} {roi:+.1f}%"
+        t_str  = f" │ {trend['delta']:+.1f}%/1г" if trend else ""
+        sl_str = f" 🛑{state['stop_loss']}%" if state.get("stop_loss") else ""
+        tp_str = f" 🎯{state['take_profit']}%" if state.get("take_profit") else ""
+        pending = [l for l in ALERT_LEVELS if l not in state["alerted"]]
         lines.append(
-            f"*{dt.strftime('%d.%m.%Y')}* {_days_label(dt)}\n"
-            f"  `{lbl}` │ куп. {buy}% → *{current_pct}%*{profit}\n"
-            f"  Наст. алерт: {pending[0]}%" if pending else "  Всі алерти надіслано"
+            f"*{dt.strftime('%d.%m')}{_days_label(dt)}* `{lbl}`\n"
+            f"  {buy}% → *{cur}%*{roi_str}{t_str}{sl_str}{tp_str}\n"
+            f"  Алерт → {pending[0]}%" if pending else "  ✅ всі алерти"
         )
         lines.append(f"  [Polymarket]({link})\n")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Деталі однієї позиції."""
-    dt, err = parse_target_date(context.args)
-    if err:
-        # Якщо одна позиція — показуємо її
-        active = {dk: s for dk, s in monitoring.items() if s.get("active")}
-        if len(active) == 1:
-            dk    = list(active.keys())[0]
-            state = active[dk]
-            dt    = state["target_date"]
-        else:
-            await update.message.reply_text(
-                f"❓ Вкажи дату: `/status 28.04`\n"
-                f"Або перегляньте всі: /positions",
-                parse_mode="Markdown"
-            )
-            return
-
-    dk    = _date_key(dt)
-    state = _get_or_none(dk)
-    if not state:
-        await update.message.reply_text(
-            f"⚠️ Немає активної позиції на {dt.strftime('%d.%m.%Y')}.",
-            parse_mode="Markdown"
-        )
-        return
-
-    lbl = state["outcome_label"]
-    _, markets, link = get_polymarket_data(dt)
-    outcomes    = parse_all_outcomes(markets) if markets else {}
-    current_pct = outcomes.get(lbl, "?")
-
-    alerted = state["alerted"]
-    pending = [l for l in ALERT_LEVELS if l not in alerted]
-
-    await update.message.reply_text(
-        f"👁 *Позиція {dt.strftime('%d.%m.%Y')}*\n\n"
-        f"🎯 `{lbl}`\n"
-        f"💰 Куплено @ {state['buy_pct']}%\n"
-        f"📊 Зараз: *{current_pct}%*\n"
-        f"🔔 Наступний алерт: {pending[0]}%" if pending else "🔔 Всі алерти надіслано"
-        + f"\n✅ Надіслані: {', '.join(str(l)+'%' for l in alerted) or 'немає'}\n\n"
-        f"🔗 {link}\n"
-        f"Закрити: `/sell {dt.strftime('%d.%m')}`",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                    reply_markup=positions_keyboard(active))
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not SOURCE_STATS:
         await update.message.reply_text(
-            "📊 Статистики ще немає.\n\n"
-            "Записати факт: `/actual Open-Meteo 17.9 16.5 4`\n"
-            "Після 5 записів бот використовує навчену поправку замість базової.",
-            parse_mode="Markdown",
-        )
-        return
-    lines = ["📊 *Точність джерел (EGLC bias)*\n"]
+            "📊 Немає даних.\nЗапис: `/actual ECMWF 17.2 16.5 4`",
+            parse_mode="Markdown"); return
+    lines = ["📊 *Точність моделей (EGLC)*\n"]
     for src, months in SOURCE_STATS.items():
         lines.append(f"*{src}:*")
         for mk, st in sorted(months.items(), key=lambda x: int(x[0])):
             mn = datetime(2000, int(mk), 1).strftime("%B")
-            lines.append(
-                f"  {mn}: MAE {st['mae']:.1f}°C, зміщ {st['bias']:+.1f}°C (n={st['n']})"
-            )
+            lines.append(f"  {mn}: MAE {st['mae']:.1f}°C, зміщ {st['bias']:+.1f}°C (n={st['n']})")
         lines.append("")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                    reply_markup=main_keyboard())
 
 
 async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /actual <source> <predicted> <actual_EGLC> [month]
-    Приклад: /actual Open-Meteo 17.9 16.5 4
-    """
     if len(context.args) < 3:
         await update.message.reply_text(
-            "❓ `/actual <джерело> <прогноз°C> <факт EGLC°C> [місяць]`\n\n"
-            "Приклад: `/actual Open-Meteo 17.9 16.5 4`\n"
-            "Джерела: `Open-Meteo` `wttr.in` `Tomorrow.io` `NOAA/GFS`",
-            parse_mode="Markdown",
-        )
-        return
+            "❓ `/actual <джерело> <прогноз> <факт> [місяць]`\n"
+            "Джерела: `ECMWF` `DWD ICON` `UK Met Office`\n"
+            "Приклад: `/actual ECMWF 17.2 16.5 4`",
+            parse_mode="Markdown"); return
     try:
-        src       = context.args[0]
-        predicted = float(context.args[1])
-        actual    = float(context.args[2])
-        month     = int(context.args[3]) if len(context.args) > 3 else datetime.utcnow().month
+        src = context.args[0]; predicted = float(context.args[1]); actual = float(context.args[2])
+        month = int(context.args[3]) if len(context.args) > 3 else datetime.utcnow().month
     except (ValueError, IndexError):
-        await update.message.reply_text("❌ Невірний формат.", parse_mode="Markdown")
-        return
-
+        await update.message.reply_text("❌ Невірний формат.", parse_mode="Markdown"); return
     record_actual(src, month, predicted, actual)
     new_bias = get_learned_bias(src, month)
     n = SOURCE_STATS.get(src, {}).get(str(month), {}).get("n", 0)
-
     await update.message.reply_text(
-        f"✅ Записано:\n"
-        f"  `{src}` — прогноз {predicted}°C, факт EGLC {actual}°C\n"
-        f"  Помилка: {predicted-actual:+.1f}°C\n\n"
-        f"  Нова поправка (місяць {month}): *{new_bias:+.2f}°C* (n={n})\n"
-        f"  {'✅ Навчена поправка активна' if n >= 5 else f'⏳ Ще {5-n} записів до активації'}\n\n"
-        f"/history — вся статистика",
-        parse_mode="Markdown",
-    )
+        f"✅ `{src}`: {predicted}°C → {actual}°C (помилка {predicted-actual:+.1f}°C)\n"
+        f"Поправка: *{new_bias:+.2f}°C* (n={n})\n"
+        f"{'✅ Активна' if n >= 5 else f'⏳ Ще {5-n} до активації'}",
+        parse_mode="Markdown", reply_markup=main_keyboard())
+
+
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await job_morning_briefing(context)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUTTON HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+    now  = datetime.utcnow()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    cid  = update.effective_chat.id
+
+    if text == "🔍 Прогноз завтра":
+        await _send_full_report(context.bot, tomorrow, cid, "🔍 Прогноз")
+    elif text == "📅 Прогноз 2 дні":
+        await update.message.reply_text("⏳ Збираю дані для 2 днів…")
+        for days in (1, 2):
+            dt = (now + timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+            await _send_full_report(context.bot, dt, cid, "🔍 Прогноз")
+    elif text == "📊 Polymarket завтра":
+        context.args = []
+        await cmd_poll(update, context)
+    elif text == "📈 Мої позиції":
+        await cmd_positions(update, context)
+    elif text == "🌤 Погода завтра":
+        context.args = []
+        await cmd_forecast(update, context)
+    elif text == "📉 Тренд цін":
+        context.args = []
+        await cmd_trend(update, context)
+    elif text == "📋 Брифінг":
+        await job_morning_briefing(context)
+    elif text == "❓ Допомога":
+        await cmd_start(update, context)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    if data.startswith("sell_"):
+        dk    = data[5:]; state = monitoring.get(dk)
+        if not state or not state.get("active"):
+            await query.edit_message_text("⚠️ Позиція вже закрита."); return
+        dt  = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
+        _, markets, _ = get_polymarket_data(dt)
+        outcomes = parse_all_outcomes(markets) if markets else {}
+        cur = outcomes.get(lbl, "?"); state["active"] = False
+        profit = ""
+        if isinstance(cur, float) and isinstance(buy, float) and buy > 0:
+            roi = round((cur/buy-1)*100, 1); profit = f"\nROI: {roi:+.1f}%"
+        await query.edit_message_text(
+            f"🛑 *Закрито*\n{dt.strftime('%d.%m')} `{lbl}`: {buy}% → {cur}%{profit}",
+            parse_mode="Markdown")
+
+    elif data.startswith("trend_"):
+        dk    = data[6:]; state = monitoring.get(dk)
+        if not state: await query.edit_message_text("⚠️ Позиція не знайдена."); return
+        trend = get_trend(dk, state["outcome_label"], 180)
+        if not trend: await query.edit_message_text("📊 Недостатньо даних."); return
+        arrow = "📈" if trend["delta"] > 0 else "📉"
+        await query.edit_message_text(
+            f"📊 `{state['outcome_label']}`\n"
+            f"{arrow} {trend['first']}% → *{trend['last']}%* ({trend['delta']:+.1f}%)\n"
+            f"`{trend['spark']}`", parse_mode="Markdown")
+
+    elif data == "refresh_positions":
+        await cmd_positions(update, context)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1229,42 +1087,39 @@ async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN env var not set!")
-    if not CHAT_ID:
-        raise ValueError("CHAT_ID env var not set!")
+    if not TOKEN:  raise ValueError("BOT_TOKEN not set!")
+    if not CHAT_ID: raise ValueError("CHAT_ID not set!")
 
     load_history()
+    load_price_history()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("check",     cmd_check))
-    app.add_handler(CommandHandler("check2",    cmd_check2))
-    app.add_handler(CommandHandler("poll",      cmd_poll))
-    app.add_handler(CommandHandler("forecast",  cmd_forecast))
-    app.add_handler(CommandHandler("buy",       cmd_buy))
-    app.add_handler(CommandHandler("sell",      cmd_sell))
-    app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("status",    cmd_status))
-    app.add_handler(CommandHandler("history",   cmd_history))
-    app.add_handler(CommandHandler("actual",    cmd_actual))
+    for cmd, handler in [
+        ("start",     cmd_start),     ("check",    cmd_check),
+        ("check2",    cmd_check2),    ("poll",     cmd_poll),
+        ("forecast",  cmd_forecast),  ("trend",    cmd_trend),
+        ("buy",       cmd_buy),       ("sell",     cmd_sell),
+        ("positions", cmd_positions), ("history",  cmd_history),
+        ("actual",    cmd_actual),    ("briefing", cmd_briefing),
+    ]:
+        app.add_handler(CommandHandler(cmd, handler))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     jq = app.job_queue
+    kyiv_730 = datetime.now(KYIV_TZ).replace(hour=7,  minute=30, second=0, microsecond=0)
+    kyiv_9   = datetime.now(KYIV_TZ).replace(hour=9,  minute=0,  second=0, microsecond=0)
+    kyiv_14  = datetime.now(KYIV_TZ).replace(hour=14, minute=0,  second=0, microsecond=0)
 
-    kyiv_8  = datetime.now(KYIV_TZ).replace(hour=8,  minute=0, second=0, microsecond=0)
-    kyiv_14 = datetime.now(KYIV_TZ).replace(hour=14, minute=0, second=0, microsecond=0)
+    jq.run_daily(job_morning_briefing, time=kyiv_730.timetz(), name="briefing_730")
+    jq.run_daily(job_market_scan,      time=kyiv_9.timetz(),   name="market_scan_9")
+    jq.run_daily(job_daily_14,         time=kyiv_14.timetz(),  name="daily_14")
+    jq.run_repeating(monitor_job, interval=120, first=15, name="price_monitor")
 
-    jq.run_daily(daily_job_8,  time=kyiv_8.timetz(),  name="morning_8_kyiv")
-    jq.run_daily(daily_job_14, time=kyiv_14.timetz(), name="daily_14_kyiv")
-    jq.run_repeating(monitor_job, interval=600, first=30, name="price_monitor")
-
-    logger.info(
-        "Bot v3 started | 08:00 + 14:00 Kyiv | monitor every 10 min | "
-        "Tomorrow.io: %s | outlier threshold: %.1f°C",
-        "SET ✓" if TOMORROW_API_KEY else "NOT SET → NOAA/GFS",
-        OUTLIER_THRESHOLD,
-    )
+    start_keep_alive()
+    logger.info("Bot v4 | 07:30 briefing | 09:00 scan | 14:00 daily | monitor 2min")
     app.run_polling()
 
 
