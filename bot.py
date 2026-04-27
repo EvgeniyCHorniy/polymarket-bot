@@ -426,23 +426,42 @@ def get_polymarket_data(dt: datetime) -> tuple[dict | None, list, str]:
     return data[0], data[0].get("markets", []), link
 
 
+def _normalize_temp_label(raw_label: str) -> str:
+    """
+    Нормалізує label до короткого формату.
+    Polymarket повертає або короткий "17°C" або довгий
+    "Will the highest temperature in London be 17°C on April 29?"
+    """
+    if re.match(r"^\d+\s*°C(\s+(or\s+(below|higher)))?$", raw_label.strip(), re.I):
+        return raw_label.strip()
+    m = re.search(r"(\d+)\s*°C\s+or\s+(below|higher)", raw_label, re.I)
+    if m:
+        return f"{m.group(1)}°C or {m.group(2).lower()}"
+    m = re.search(r"(\d+)\s*°C", raw_label)
+    if m:
+        return f"{m.group(1)}°C"
+    return raw_label.strip()
+
+
 def parse_all_outcomes(markets: list) -> dict:
     """
     {temperature_label: yes_probability_%}
-    outcomePrices приходить як JSON-рядок "[\"0.32\",\"0.68\"]"
-    prices[0] = YES (0..1), конвертуємо в %.
+    Label нормалізується до короткого формату: "17°C", "16°C or below".
+    outcomePrices — JSON-рядок "[\"0.32\",\"0.68\"]", prices[0] = YES.
     """
     result = {}
     for m in markets:
-        label = m.get("question", "").strip()
-        if not label:
+        raw_label = m.get("question", "").strip()
+        if not raw_label:
             outs = m.get("outcomes", "[]")
             if isinstance(outs, str):
                 try:
                     outs = json.loads(outs)
                 except Exception:
                     outs = []
-            label = outs[0] if outs else "Unknown"
+            raw_label = outs[0] if outs else "Unknown"
+
+        label = _normalize_temp_label(raw_label)
 
         prices_raw = m.get("outcomePrices", "[]")
         if isinstance(prices_raw, str):
@@ -459,6 +478,7 @@ def parse_all_outcomes(markets: list) -> dict:
             except Exception:
                 result[label] = 0.0
     return result
+
 
 
 def find_outcome_for_temp(outcomes: dict, temp: int) -> tuple[str | None, float | None]:
