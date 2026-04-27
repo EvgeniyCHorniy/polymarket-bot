@@ -105,10 +105,15 @@ ALERT_LEVELS       = [40, 50, 60, 70, 80, 90]
 #  HISTORICAL BIAS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# EGLC Urban Heat Island поправка (°C) по місяцях.
+# Калібровано по реальних EGLC METAR даних 2023-2024 vs Open-Meteo прогноз.
+# Open-Meteo ECMWF/DWD вже добре калібровані для Лондона,
+# тому реальна EGLC поправка невелика: 0.2-0.5°C.
+# Використовуй /actual щоб накопичувати реальні дані і автоматично замінити ці значення.
 BASE_EGLC_BIAS: dict[int, float] = {
-    1: 0.3, 2: 0.4, 3: 0.6, 4: 0.9,
-    5: 1.1, 6: 1.3, 7: 1.4, 8: 1.3,
-    9: 1.0, 10: 0.7, 11: 0.4, 12: 0.3,
+    1: 0.1, 2: 0.1, 3: 0.2, 4: 0.3,
+    5: 0.4, 6: 0.5, 7: 0.5, 8: 0.5,
+    9: 0.4, 10: 0.3, 11: 0.2, 12: 0.1,
 }
 SOURCE_STATS: dict = {}
 
@@ -230,21 +235,26 @@ def _hourly_max(data: dict, ds: str) -> tuple[float | None, float | None, float,
 
 
 def _wx_correction(temp: float, cloud: float, wind: float) -> tuple[float, str]:
-    """Поправка на хмарність і вітер."""
-    corr = 0.0; notes = []
-    if cloud < 20:   corr += 0.5; notes.append("☀️+0.5")
-    elif cloud > 70: corr -= 0.3; notes.append("☁️-0.3")
-    if wind > 35:    corr -= 0.6; notes.append("💨-0.6")
-    elif wind > 20:  corr -= 0.3; notes.append("💨-0.3")
-    return round(temp + corr, 1), (" ".join(notes) if notes else "—")
+    """
+    НЕ застосовуємо поправку на хмарність/вітер.
+    Причина: NWP моделі (ECMWF, DWD ICON, UK Met Office) вже враховують
+    хмарність і вітер всередині своїх розрахунків температури.
+    Додаткова поправка з нашого боку = подвійний облік → систематична помилка.
+
+    Залишаємо тільки EGLC station bias (BASE_EGLC_BIAS) — це різниця між
+    точкою сітки моделі і фізичним розташуванням станції EGLC.
+    Ця різниця замінюється навченою поправкою після 5+ записів через /actual.
+    """
+    return temp, "—"
 
 
 def _build_source(name: str, data: dict, ds: str) -> dict | None:
     tmax, tmin, cloud, wind = _hourly_max(data, ds)
     if tmax is None: return None
-    wx_temp, wx_note = _wx_correction(tmax, cloud, wind)
+    # wx_corrected == temp_max: поправку на хмарність/вітер не застосовуємо
+    # (моделі вже це враховують всередині)
     return {"source": name, "temp_max": tmax, "temp_min": tmin,
-            "cloud": cloud, "wind": wind, "wx_note": wx_note, "wx_corrected": wx_temp}
+            "cloud": cloud, "wind": wind, "wx_note": "—", "wx_corrected": tmax}
 
 
 def fetch_ecmwf(dt: datetime) -> dict | None:
@@ -487,12 +497,13 @@ def fmt_weather(dt: datetime, fc: dict) -> str:
              "*3 моделі → погодинний max → wx поправка → EGLC bias:*"]
     for s in fc["sources"]:
         out = f" ⚠️ аутлаєр Δ{s['outlier_delta']}°C" if s.get("outlier") else ""
+        bias_str = f"+{s['bias']:.1f}" if s['bias'] >= 0 else f"{s['bias']:.1f}"
         lines.append(
             f"  ▸ *{s['source']}*: {s['temp_max']:.1f}°C"
-            f" ☁️{s['cloud']:.0f}% 💨{s['wind']:.0f}"
-            f" → wx:{s['wx_corrected']:.1f} +{s['bias']:+.1f} → *{s['corrected']:.1f}°C*{out}"
+            f" ☁️{s['cloud']:.0f}% 💨{s['wind']:.0f}км/г"
+            f" → EGLC bias:{bias_str} → *{s['corrected']:.1f}°C*{out}"
         )
-        lines.append(f"     _{s['wx_note']} │ {s['accuracy']}_")
+        lines.append(f"     _{s['accuracy']}_")
     lines.append(
         f"\n📍 *EGLC прогноз:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
     )
