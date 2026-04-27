@@ -58,6 +58,40 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+# всі import-и вище 👆
+
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import time
+
+# === HTTP server ===
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+# === self-ping ===
+def self_ping():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        print("⚠️ RENDER_EXTERNAL_URL not set")
+        return
+    while True:
+        try:
+            requests.get(url, timeout=10)
+            print("🔁 self ping OK")
+        except Exception as e:
+            print(f"ping error: {e}")
+        time.sleep(300)
+
+threading.Thread(target=run_web, daemon=True).start()
+threading.Thread(target=self_ping, daemon=True).start()
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
