@@ -604,7 +604,9 @@ def fmt_polymarket(
                 if tgt_pct < 20:
                     lines.append("🟢 *< 20% — ДУЖЕ вигідно! Сильний сигнал купівлі*")
                 elif tgt_pct < 38:
-                    lines.append(f"🟢 *< 38% — Сигнал BUY* → `/buy {re.search(r'(\\d+)', tgt_lbl).group(1) if re.search(r'(\\d+)', tgt_lbl) else '??'}`")
+                    _m = re.search(r"(\d+)", tgt_lbl)
+                    _num = _m.group(1) if _m else "??"
+                    lines.append(f"🟢 *< 38% — Сигнал BUY* → `/buy {_num}`")
                 elif tgt_pct < 50:
                     lines.append("⏳ *38–50% — тримати / чекати*")
                 elif tgt_pct < 65:
