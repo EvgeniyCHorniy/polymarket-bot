@@ -4,7 +4,7 @@ London EGLC Temperature Polymarket Bot v4
 
 НОВЕ в v4:
   1. 3 найточніші моделі для Лондона (Open-Meteo, без ключів):
-       ECMWF IFS      /v1/forecast?models=ecmwf_ifs04  (9 км)
+       ECMWF IFS      /v1/forecast (ECMWF best-match, 9 км)
        DWD ICON       /v1/dwd-icon                      (2 км, найкращий для Європи)
        UK Met Office  /v1/ukmo                          (2 км, офіційний британський)
      + Погодинний max: беремо hourly і рахуємо max самі (точніше ніж daily)
@@ -252,10 +252,9 @@ def fetch_ecmwf(dt: datetime) -> dict | None:
     ds = dt.strftime("%Y-%m-%d")
     data = _safe_get("https://api.open-meteo.com/v1/forecast", params={
         "latitude": EGLC_LAT, "longitude": EGLC_LON,
-        "hourly": "temperature_2m,cloudcover,windspeed_10m",
+        "hourly": "temperature_2m,cloud_cover,windspeed_10m",
         "timezone": "Europe/London", "start_date": ds, "end_date": ds,
-        "models": "ecmwf_ifs04",
-    })
+        })
     return _build_source("ECMWF", data, ds) if data else None
 
 
@@ -264,7 +263,7 @@ def fetch_dwd_icon(dt: datetime) -> dict | None:
     ds = dt.strftime("%Y-%m-%d")
     data = _safe_get("https://api.open-meteo.com/v1/dwd-icon", params={
         "latitude": EGLC_LAT, "longitude": EGLC_LON,
-        "hourly": "temperature_2m,cloudcover,windspeed_10m",
+        "hourly": "temperature_2m,cloud_cover,windspeed_10m",
         "timezone": "Europe/London", "start_date": ds, "end_date": ds,
     })
     return _build_source("DWD ICON", data, ds) if data else None
@@ -275,16 +274,16 @@ def fetch_ukmet(dt: datetime) -> dict | None:
     ds = dt.strftime("%Y-%m-%d")
     # Пробуємо два можливих endpoint
     for url, params in [
-        ("https://api.open-meteo.com/v1/ukmo", {
+        ("https://api.open-meteo.com/v1/ukmo_seamless", {
             "latitude": EGLC_LAT, "longitude": EGLC_LON,
-            "hourly": "temperature_2m,cloudcover,windspeed_10m",
+            "hourly": "temperature_2m,cloud_cover,windspeed_10m",
             "timezone": "Europe/London", "start_date": ds, "end_date": ds,
         }),
         ("https://api.open-meteo.com/v1/forecast", {
             "latitude": EGLC_LAT, "longitude": EGLC_LON,
-            "hourly": "temperature_2m,cloudcover,windspeed_10m",
+            "hourly": "temperature_2m,cloud_cover,windspeed_10m",
             "timezone": "Europe/London", "start_date": ds, "end_date": ds,
-            "models": "uk_met_office",
+            "models": "ukmo_seamless",
         }),
     ]:
         data = _safe_get(url, params=params)
@@ -495,7 +494,7 @@ def fmt_weather(dt: datetime, fc: dict) -> str:
         )
         lines.append(f"     _{s['wx_note']} │ {s['accuracy']}_")
     lines.append(
-        f"\n📍 *EGLC: {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
+        f"\n📍 *EGLC прогноз:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
     )
     lines.append(
         f"   _(зваж: {fc['weighted_avg']:.1f} │ медіана: {fc['median']:.1f}"
