@@ -968,7 +968,7 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Температура — ціле число.", parse_mode="Markdown"); return
 
     remaining = list(context.args[1:])
-    stop_loss = None; take_profit = None; clean_args = []
+    stop_loss = None; take_profit = None; buy_price = None; clean_args = []
     i = 0
     while i < len(remaining):
         if remaining[i] == "--stop" and i+1 < len(remaining):
@@ -976,6 +976,9 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except: pass
         if remaining[i] == "--tp" and i+1 < len(remaining):
             try: take_profit = float(remaining[i+1]); i += 2; continue
+            except: pass
+        if remaining[i] == "--price" and i+1 < len(remaining):
+            try: buy_price = float(remaining[i+1]); i += 2; continue
             except: pass
         clean_args.append(remaining[i]); i += 1
 
@@ -1012,16 +1015,25 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending = [l for l in ALERT_LEVELS if l not in already]
     monitoring[dk] = {
         "active": True, "target_date": dt, "outcome_label": lbl, "temp_int": temp_int,
-        "buy_pct": pct, "alerted": already, "poly_link": link,
+        "buy_pct": buy_price if buy_price is not None else pct,
+        "alerted": already, "poly_link": link,
         "stop_loss": stop_loss, "take_profit": take_profit,
         "tp_alerted": False, "sl_alerted": False, "alerted_mom": [],
     }
     sl_str = f"\n🛑 Стоп-лос: *{stop_loss}%*" if stop_loss else ""
     tp_str = f"\n🎯 Тейк-профіт: *{take_profit}%*" if take_profit else ""
+    recorded_pct = buy_price if buy_price is not None else pct
+    price_note = ""
+    roi_str = ""
+    if buy_price is not None:
+        price_note = f"\n💵 Куплено за: *{buy_price}%* _(зараз {pct}%)_"
+        if pct and buy_price > 0:
+            roi = round((pct / buy_price - 1) * 100, 1)
+            roi_str = f"\n📈 Поточний ROI: *{roi:+.1f}%*"
     await update.message.reply_text(
         f"✅ *Позицію відкрито*\n\n"
         f"📅 {dt.strftime('%d.%m.%Y')}\n"
-        f"🎯 `{lbl}`\n💰 *{pct}%*{sl_str}{tp_str}\n\n"
+        f"🎯 `{lbl}`\n💰 *{recorded_pct}%*{price_note}{roi_str}{sl_str}{tp_str}\n\n"
         f"🔔 Алерти: {', '.join(str(l)+'%' for l in pending) or 'всі пройдено'}\n"
         f"Позицій: {sum(1 for s in monitoring.values() if s.get('active'))}\n\n🔗 {link}",
         parse_mode="Markdown", reply_markup=main_keyboard())
