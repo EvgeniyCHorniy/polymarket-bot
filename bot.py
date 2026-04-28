@@ -239,6 +239,46 @@ def cache_forecast(dt: datetime, fc: dict) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FORECAST CHANGE MONITOR — алерт якщо прогноз змінився на ≥1°C
+# ══════════════════════════════════════════════════════════════════════════════
+
+# { "2026-04-29": {"final": 17.0, "ts": "2026-04-28T14:00"} }
+forecast_change_log: dict = {}
+FORECAST_CHANGE_FILE = Path("forecast_changes.json")
+
+
+def load_forecast_changes() -> None:
+    global forecast_change_log
+    if FORECAST_CHANGE_FILE.exists():
+        try: forecast_change_log = json.loads(FORECAST_CHANGE_FILE.read_text())
+        except: forecast_change_log = {}
+
+
+def save_forecast_changes() -> None:
+    try: FORECAST_CHANGE_FILE.write_text(json.dumps(forecast_change_log, indent=2))
+    except Exception as e: logger.error("Save forecast changes: %s", e)
+
+
+def check_forecast_change(dt: datetime, new_final: float) -> tuple[bool, float]:
+    """
+    Порівнює новий прогноз з попереднім.
+    Повертає (changed, prev_final) де changed=True якщо різниця >= 1°C.
+    """
+    dk = dt.strftime("%Y-%m-%d")
+    prev = forecast_change_log.get(dk)
+    forecast_change_log[dk] = {
+        "final": new_final,
+        "ts": datetime.utcnow().isoformat(timespec="minutes"),
+    }
+    save_forecast_changes()
+    if prev is None:
+        return False, new_final
+    prev_final = prev["final"]
+    changed = abs(new_final - prev_final) >= 1.0
+    return changed, prev_final
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  WEATHER — 3 найточніші моделі для Лондона
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -482,9 +522,13 @@ def polymarket_consensus(outcomes: dict, forecast_temp: int) -> str:
 #  DATE PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_target_date(args: list) -> tuple[datetime | None, str | None]:
+def _parse_date_raw(args: list, allow_past: bool = False) -> tuple[datetime | None, str | None]:
+    """Базовий парсер дати. allow_past=True — дозволяє минулі дати (для /actual)."""
     if not args:
-        t = datetime.utcnow() + timedelta(days=1)
+        if allow_past:
+            t = datetime.utcnow() - timedelta(days=1)  # вчора для /actual
+        else:
+            t = datetime.utcnow() + timedelta(days=1)  # завтра для /check
         return t.replace(hour=0, minute=0, second=0, microsecond=0), None
     raw = args[0].strip().replace("/", ".")
     now = datetime.utcnow()
@@ -499,13 +543,31 @@ def parse_target_date(args: list) -> tuple[datetime | None, str | None]:
             try:
                 day, month, year = ext(m)
                 dt = datetime(year, month, day)
-                if raw.count(".") == 1 and dt.date() < now.date(): dt = dt.replace(year=year+1)
                 ahead = (dt.date() - now.date()).days
-                if ahead < 0:  return None, f"❌ Дата {dt.strftime('%d.%m.%Y')} вже минула."
-                if ahead > 15: return None, "❌ Прогноз максимум на 15 днів."
+                if allow_past:
+                    # Для /actual: дозволяємо минулі, але не більше 30 днів назад
+                    if ahead < -30: return None, f"❌ Дата {dt.strftime('%d.%m.%Y')} надто давня (> 30 днів)."
+                    if ahead > 1:   return None, f"❌ Дата {dt.strftime('%d.%m.%Y')} ще не настала."
+                else:
+                    # Для /check: тільки майбутні
+                    if raw.count(".") == 1 and dt.date() < now.date():
+                        dt = dt.replace(year=year+1)
+                        ahead = (dt.date() - now.date()).days
+                    if ahead < 0:  return None, f"❌ Дата {dt.strftime('%d.%m.%Y')} вже минула."
+                    if ahead > 15: return None, "❌ Прогноз максимум на 15 днів."
                 return dt, None
             except ValueError as e: return None, f"❌ Дата `{raw}`: {e}"
     return None, f"❌ Не розпізнав: `{raw}`. Формат: DD.MM або DD.MM.YYYY"
+
+
+def parse_target_date(args: list) -> tuple[datetime | None, str | None]:
+    """Для /check, /poll, /forecast — тільки майбутні дати."""
+    return _parse_date_raw(args, allow_past=False)
+
+
+def parse_past_date(args: list) -> tuple[datetime | None, str | None]:
+    """Для /actual — минулі та сьогоднішні дати."""
+    return _parse_date_raw(args, allow_past=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -623,6 +685,19 @@ async def _send_full_report(bot: Bot, dt: datetime,
     if "error" in fc:
         await bot.send_message(chat_id=chat_id, text=f"⚠️ {fc['error']}"); return
     cache_forecast(dt, fc)  # зберігаємо для /actual
+    # Перевіряємо чи змінився прогноз порівняно з попереднім разом
+    changed, prev_final = check_forecast_change(dt, fc["final_temp"])
+    if changed:
+        direction = "🔺" if fc["final_temp"] > prev_final else "🔻"
+        await bot.send_message(
+            chat_id=chat_id, parse_mode="Markdown",
+            text=(
+                f"{direction} *Прогноз змінився — {dt.strftime('%d.%m.%Y')}*\n\n"
+                f"Було: *{prev_final:.1f}°C* → Стало: *{fc['final_temp']:.1f}°C*\n"
+                f"Різниця: {fc['final_temp']-prev_final:+.1f}°C\n\n"
+                f"Перевір позиції: /positions"
+            )
+        )
     _, markets, link = get_polymarket_data(dt)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
@@ -1055,9 +1130,9 @@ async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "❌ Вкажи температуру числом. Приклад: `/actual 16.5`",
             parse_mode="Markdown"); return
 
-    # Визначаємо дату
+    # Визначаємо дату (parse_past_date — дозволяє минулі)
     if len(context.args) > 1:
-        dt, err = parse_target_date(context.args[1:])
+        dt, err = parse_past_date(context.args[1:])
         if err:
             await update.message.reply_text(err, parse_mode="Markdown"); return
     else:
@@ -1070,11 +1145,30 @@ async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cached = forecast_cache.get(dk)
 
     if not cached:
-        await update.message.reply_text(
-            f"⚠️ Немає збереженого прогнозу для *{dt.strftime('%d.%m.%Y')}*.\n\n"
-            f"Прогнози зберігаються автоматично після кожного `/check` або авто-звіту.\n"
-            f"Доступні дати: {', '.join(sorted(forecast_cache.keys())[-5:]) or 'немає'}",
-            parse_mode="Markdown"); return
+        # Кеш відсутній (новий деплой або дата давня) — дозволяємо ручне введення
+        # Формат: /actual <факт> <дата> <ECMWF_прогноз> <DWD_прогноз> <UKMet_прогноз>
+        if len(context.args) >= 5:
+            try:
+                manual = {
+                    "ECMWF":          float(context.args[2]),
+                    "DWD ICON":       float(context.args[3]),
+                    "UK Met Office":  float(context.args[4]),
+                    "final":          float(context.args[2]),
+                    "month":          dt.month,
+                }
+                cached = manual
+            except (ValueError, IndexError):
+                pass
+        if not cached:
+            avail = ", ".join(sorted(forecast_cache.keys())[-5:]) or "немає"
+            await update.message.reply_text(
+                f"⚠️ Немає збереженого прогнозу для *{dt.strftime('%d.%m.%Y')}*.\n\n"
+                f"Прогнози зберігаються після кожного `/check` або авто-звіту.\n"
+                f"Доступні дати: {avail}\n\n"
+                f"*Або введи вручну:*\n"
+                f"`/actual {actual_temp} {dt.strftime('%d.%m')} <ECMWF> <DWD> <UKMet>`\n"
+                f"Приклад: `/actual {actual_temp} {dt.strftime('%d.%m')} 16.8 16.2 16.8`",
+                parse_mode="Markdown"); return
 
     # Записуємо факт для кожної моделі яка є в кеші
     lines = [f"✅ *Факт EGLC {dt.strftime('%d.%m.%Y')}: {actual_temp}°C*\n"]
@@ -1114,6 +1208,67 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ══════════════════════════════════════════════════════════════════════════════
 #  BUTTON HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+async def job_forecast_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Кожні 3 години перевіряє прогноз для всіх дат з активними позиціями.
+    Якщо прогноз змінився на >= 1°C — надсилає алерт.
+    Не залежить від /check — працює автономно.
+    """
+    active_dates = {
+        state["target_date"]
+        for state in monitoring.values()
+        if state.get("active")
+    }
+
+    if not active_dates:
+        return
+
+    for dt in active_dates:
+        try:
+            fc = compute_forecast(dt)
+            if "error" in fc:
+                continue
+
+            cache_forecast(dt, fc)
+            changed, prev_final = check_forecast_change(dt, fc["final_temp"])
+
+            if changed:
+                direction = "🔺" if fc["final_temp"] > prev_final else "🔻"
+                diff = fc["final_temp"] - prev_final
+
+                dk    = _date_key(dt)
+                state = monitoring.get(dk, {})
+                pos_info = ""
+                if state.get("active"):
+                    lbl = state["outcome_label"]
+                    pos_info = ("\n\U0001f4ca Твоя позиція: `"
+                               + lbl + "` @ " + str(state["buy_pct"]) + "%")
+
+                sources_str = ", ".join(
+                    s["source"] + " " + f"{s['temp_max']:.1f}°C"
+                    for s in fc["sources"]
+                )
+                alert_text = (
+                    f"{direction} *Прогноз змінився — {dt.strftime('%d.%m.%Y')}*\n\n"
+                    f"Було: *{prev_final:.1f}°C* → Стало: *{fc['final_temp']:.1f}°C*\n"
+                    f"Зміна: *{diff:+.1f}°C*\n"
+                    f"Джерела: {sources_str}"
+                    + pos_info
+                    + "\n\n/positions — переглянути позиції"
+                )
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    parse_mode="Markdown",
+                    text=alert_text,
+                )
+                logger.info(
+                    "Forecast change alert: %s %.1f→%.1f°C",
+                    dt.strftime("%Y-%m-%d"), prev_final, fc["final_temp"]
+                )
+        except Exception as e:
+            logger.error("forecast_monitor error for %s: %s", dt.date(), e)
+
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text
@@ -1191,6 +1346,7 @@ def main() -> None:
     load_history()
     load_price_history()
     load_forecast_cache()
+    load_forecast_changes()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -1215,10 +1371,11 @@ def main() -> None:
     jq.run_daily(job_morning_briefing, time=kyiv_730.timetz(), name="briefing_730")
     jq.run_daily(job_market_scan,      time=kyiv_9.timetz(),   name="market_scan_9")
     jq.run_daily(job_daily_14,         time=kyiv_14.timetz(),  name="daily_14")
-    jq.run_repeating(monitor_job, interval=120, first=15, name="price_monitor")
+    jq.run_repeating(monitor_job,          interval=120,        first=15,   name="price_monitor")
+    jq.run_repeating(job_forecast_monitor, interval=3*60*60,    first=60,   name="forecast_monitor")  # кожні 3 год
 
     start_keep_alive()
-    logger.info("Bot v4 | 07:30 briefing | 09:00 scan | 14:00 daily | monitor 2min")
+    logger.info("Bot v4 | 07:30 briefing | 09:00 scan | 14:00 daily | price 2min | forecast 3h")
     app.run_polling()
 
 
