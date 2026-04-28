@@ -98,7 +98,8 @@ OUTLIER_THRESHOLD  = 2.0
 BUY_MAX_PCT        = 38.0
 MOMENTUM_THRESHOLD = 5.0
 HISTORY_FILE       = Path("eglc_history.json")
-PRICE_HISTORY_FILE = Path("price_history.json")
+PRICE_HISTORY_FILE   = Path("price_history.json")
+FORECAST_CACHE_FILE  = Path("forecast_cache.json")  # зберігаємо прогнози для /actual
 ALERT_LEVELS       = [40, 50, 60, 70, 80, 90]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -201,6 +202,40 @@ def get_trend(date_key: str, label: str, minutes: int = 180) -> dict | None:
     spark = "".join(chars[int((v-mn)/(mx-mn)*7)] if mx != mn else "▄" for v in vals)
     return {"first": first_pct, "last": last_pct, "delta": delta,
             "momentum": momentum, "n": len(recent), "spark": spark, "minutes": minutes}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FORECAST CACHE — зберігаємо прогнози щоб /actual міг їх знайти
+# ══════════════════════════════════════════════════════════════════════════════
+
+# { "2026-04-28": { "ECMWF": 16.8, "DWD ICON": 16.2, "UK Met Office": 16.8, "final": 17.0 } }
+forecast_cache: dict = {}
+
+
+def load_forecast_cache() -> None:
+    global forecast_cache
+    if FORECAST_CACHE_FILE.exists():
+        try: forecast_cache = json.loads(FORECAST_CACHE_FILE.read_text())
+        except: forecast_cache = {}
+
+
+def save_forecast_cache() -> None:
+    try: FORECAST_CACHE_FILE.write_text(json.dumps(forecast_cache, indent=2))
+    except Exception as e: logger.error("Save forecast cache: %s", e)
+
+
+def cache_forecast(dt: datetime, fc: dict) -> None:
+    """Зберігає прогноз після кожного compute_forecast."""
+    dk = dt.strftime("%Y-%m-%d")
+    entry = {"final": fc.get("final_temp"), "month": fc.get("month")}
+    for s in fc.get("sources", []):
+        entry[s["source"]] = s["temp_max"]  # зберігаємо raw temp_max кожної моделі
+    forecast_cache[dk] = entry
+    # Зберігаємо лише останні 30 днів
+    keys = sorted(forecast_cache.keys())
+    for old_key in keys[:-30]:
+        del forecast_cache[old_key]
+    save_forecast_cache()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,6 +622,7 @@ async def _send_full_report(bot: Bot, dt: datetime,
     fc = compute_forecast(dt)
     if "error" in fc:
         await bot.send_message(chat_id=chat_id, text=f"⚠️ {fc['error']}"); return
+    cache_forecast(dt, fc)  # зберігаємо для /actual
     _, markets, link = get_polymarket_data(dt)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
@@ -998,25 +1034,77 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 3:
+    """
+    /actual <факт°C> [DD.MM]
+    Бот сам знає що прогнозував — треба вказати тільки фактичну температуру EGLC.
+    Якщо дату не вказано — використовується вчора.
+    """
+    if not context.args:
         await update.message.reply_text(
-            "❓ `/actual <джерело> <прогноз> <факт> [місяць]`\n"
-            "Джерела: `ECMWF` `DWD ICON` `UK Met Office`\n"
-            "Приклад: `/actual ECMWF 17.2 16.5 4`",
+            "❓ `/actual <факт EGLC°C> [DD.MM]`\n\n"
+            "Вкажи лише *фактичну* температуру — бот сам знає свій прогноз.\n\n"
+            "Приклади:\n"
+            "`/actual 16.5` — факт за вчора\n"
+            "`/actual 16.5 28.04` — факт за конкретний день",
             parse_mode="Markdown"); return
+
     try:
-        src = context.args[0]; predicted = float(context.args[1]); actual = float(context.args[2])
-        month = int(context.args[3]) if len(context.args) > 3 else datetime.utcnow().month
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Невірний формат.", parse_mode="Markdown"); return
-    record_actual(src, month, predicted, actual)
-    new_bias = get_learned_bias(src, month)
-    n = SOURCE_STATS.get(src, {}).get(str(month), {}).get("n", 0)
-    await update.message.reply_text(
-        f"✅ `{src}`: {predicted}°C → {actual}°C (помилка {predicted-actual:+.1f}°C)\n"
-        f"Поправка: *{new_bias:+.2f}°C* (n={n})\n"
-        f"{'✅ Активна' if n >= 5 else f'⏳ Ще {5-n} до активації'}",
-        parse_mode="Markdown", reply_markup=main_keyboard())
+        actual_temp = float(context.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Вкажи температуру числом. Приклад: `/actual 16.5`",
+            parse_mode="Markdown"); return
+
+    # Визначаємо дату
+    if len(context.args) > 1:
+        dt, err = parse_target_date(context.args[1:])
+        if err:
+            await update.message.reply_text(err, parse_mode="Markdown"); return
+    else:
+        # За замовчуванням — вчора
+        dt = (datetime.utcnow() - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+
+    dk    = dt.strftime("%Y-%m-%d")
+    month = dt.month
+    cached = forecast_cache.get(dk)
+
+    if not cached:
+        await update.message.reply_text(
+            f"⚠️ Немає збереженого прогнозу для *{dt.strftime('%d.%m.%Y')}*.\n\n"
+            f"Прогнози зберігаються автоматично після кожного `/check` або авто-звіту.\n"
+            f"Доступні дати: {', '.join(sorted(forecast_cache.keys())[-5:]) or 'немає'}",
+            parse_mode="Markdown"); return
+
+    # Записуємо факт для кожної моделі яка є в кеші
+    lines = [f"✅ *Факт EGLC {dt.strftime('%d.%m.%Y')}: {actual_temp}°C*\n"]
+    sources_in_cache = ["ECMWF", "DWD ICON", "UK Met Office"]
+    for source_name in sources_in_cache:
+        predicted = cached.get(source_name)
+        if predicted is None:
+            lines.append(f"  ⚠️ {source_name}: прогноз не знайдено в кеші")
+            continue
+        error = round(predicted - actual_temp, 1)
+        record_actual(source_name, month, predicted, actual_temp)
+        new_bias = get_learned_bias(source_name, month)
+        n = SOURCE_STATS.get(source_name, {}).get(str(month), {}).get("n", 0)
+        status = "✅ активна" if n >= 5 else f"⏳ ще {5-n}"
+        lines.append(
+            f"  *{source_name}*: прогноз {predicted}°C, факт {actual_temp}°C, "
+            f"помилка {error:+.1f}°C\n"
+            f"    → поправка: *{new_bias:+.2f}°C* (n={n}, {status})"
+        )
+
+    # Фінальний прогноз
+    final = cached.get("final")
+    if final:
+        final_err = round(final - actual_temp, 1)
+        lines.append(f"\n📍 Фінальний прогноз: {final}°C, факт: {actual_temp}°C, "
+                     f"помилка: {final_err:+.1f}°C")
+
+    lines.append("\n/history — вся статистика")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                    reply_markup=main_keyboard())
 
 
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1102,6 +1190,7 @@ def main() -> None:
 
     load_history()
     load_price_history()
+    load_forecast_cache()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
