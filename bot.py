@@ -94,6 +94,22 @@ TOMORROW_API_KEY = os.getenv("TOMORROW_API_KEY", "")
 KYIV_TZ            = pytz.timezone("Europe/Kiev")
 EGLC_LAT           = 51.5048
 EGLC_LON           = 0.0495
+
+CITIES = {
+    "london": {
+        "name": "London", "emoji": "🇬🇧",
+        "lat": 51.5048, "lon": 0.0495,
+        "station": "EGLC", "slug_city": "london",
+        "tz": "Europe/London",
+    },
+    "munich": {
+        "name": "Munich", "emoji": "🇩🇪",
+        "lat": 48.3537, "lon": 11.7750,
+        "station": "EDDM", "slug_city": "munich",
+        "tz": "Europe/Berlin",
+    },
+}
+
 OUTLIER_THRESHOLD  = 2.0
 BUY_MAX_PCT        = 38.0
 MOMENTUM_THRESHOLD = 5.0
