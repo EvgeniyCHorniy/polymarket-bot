@@ -869,20 +869,69 @@ async def job_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
-    await update.message.reply_text(
-        f"🤖 *London EGLC Temp Bot v4*\nchat\\_id: `{cid}`\n\n"
-        f"Використовуй *кнопки* або команди:\n\n"
-        f"*Прогноз:* `/check` `/check2` `/forecast` `/poll`\n"
-        f"*Торгівля:*\n"
-        f"`/buy <temp> [DD\\.MM] [\\-\\-stop X] [\\-\\-tp Y]`\n"
-        f"  напр: `/buy 17 29\\.04 \\-\\-stop 20 \\-\\-tp 65`\n"
-        f"`/sell [DD\\.MM|all]` `/positions` `/trend`\n"
-        f"*Навчання:* `/actual` `/history`\n"
-        f"`/briefing` — ручний брифінг\n\n"
-        f"⏰ Авто: 07:30 брифінг │ 09:00 скан │ 14:00 звіт\n"
-        f"🔔 Алерти: 40→50→60→70→80→90%\n"
-        f"🛑 Стоп\\-лос │ 🎯 Тейк\\-профіт │ 🚀 Momentum",
-        parse_mode="MarkdownV2", reply_markup=main_keyboard())
+    help_text = (
+        "🤖 *London EGLC Temp Bot v4*\n"
+        f"chat_id: `" + str(cid) + "`\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 *ПЕРЕГЛЯД ПРОГНОЗУ*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Кнопки: *Сьогодні* / *Завтра* / *Після завтра*\n"
+        "або команди:\n"
+        "`/check` — завтра (за замовчуванням)\n"
+        "`/check today` або `/check 28.04` — сьогодні\n"
+        "`/check 30.04` — будь-який день (до 15 днів)\n"
+        "`/check2` — завтра + після завтра разом\n"
+        "`/forecast [DD.MM]` — лише погода (3 моделі)\n"
+        "`/poll [DD.MM]` — лише ціни Polymarket\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💰 *ТОРГІВЛЯ*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Відкрити позицію:\n"
+        "`/buy 17` — купити 17°C на завтра\n"
+        "`/buy 17 29.04` — купити 17°C на 29 квітня\n"
+        "`/buy 17 29.04 --price 35.5` — якщо купив раніше за 35.5%\n"
+        "`/buy 17 29.04 --stop 20 --tp 65` — стоп-лос і тейк-профіт\n\n"
+        "Закрити позицію:\n"
+        "`/sell` — закрити єдину активну\n"
+        "`/sell 29.04` — закрити конкретну дату\n"
+        "`/sell all` — закрити всі\n\n"
+        "Переглянути:\n"
+        "`/positions` — всі активні позиції + ROI\n"
+        "`/trend` — тренд цін по ВСІХ позиціях\n"
+        "`/trend 29.04` — тренд конкретної позиції\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🧠 *НАВЧАННЯ БОТА*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Після дня — вводь фактичну температуру EGLC:\n"
+        "`/actual 16.5` — факт за вчора\n"
+        "`/actual 16.5 28.04` — факт за конкретний день\n"
+        "_Бот сам порівняє з прогнозом і накопичить статистику_\n"
+        "`/history` — точність кожної моделі по місяцях\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⏰ *АВТОМАТИКА*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "07:30 — ранковий брифінг (погода + позиції)\n"
+        "09:00 — скан нових ринків (BUY < 38%)\n"
+        "14:00 — денний звіт на завтра\n"
+        "Кожні 2 хв — моніторинг цін позицій\n"
+        "Кожні 30 хв — перевірка зміни прогнозу погоди\n\n"
+        "`/briefing` — запустити брифінг вручну\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔔 *АЛЕРТИ*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Рівні: 40% → 50% → 60% → 70% → 80% → 90%\n"
+        "🛑 Стоп-лос: якщо ціна впала нижче порогу\n"
+        "🎯 Тейк-профіт: якщо ціна досягла цілі\n"
+        "🚀 Momentum: якщо ціна змінилась > 5% за 30хв\n"
+        "🔺 Прогноз: якщо погода змінилась на ≥ 1°C\n"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown",
+                                    reply_markup=main_keyboard())
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -928,38 +977,101 @@ async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Без аргументів або кнопка — показує тренди ВСІХ активних позицій.
+    З датою — показує тренд конкретної позиції.
+    """
+    active = {k: s for k, s in monitoring.items() if s.get("active")}
+
+    # Якщо аргумент не вказано — показуємо всі позиції
+    if not context.args:
+        if not active:
+            await update.message.reply_text(
+                "⚠️ Немає активних позицій.\nВідкрити: `/buy <temp> [DD.MM]`",
+                parse_mode="Markdown")
+            return
+        await _send_all_trends(update, active)
+        return
+
+    # Конкретна дата
     dt, err = parse_target_date(context.args)
-    if err: await update.message.reply_text(err, parse_mode="Markdown"); return
+    if err:
+        await update.message.reply_text(err, parse_mode="Markdown")
+        return
+
     dk    = _date_key(dt)
     state = monitoring.get(dk)
     if not state or not state.get("active"):
-        # Показуємо тренди всіх активних позицій
-        active = {k: s for k, s in monitoring.items() if s.get("active")}
+        # Дата не знайдена — показуємо всі
         if not active:
-            await update.message.reply_text("⚠️ Немає активних позицій."); return
-        for adk, astate in active.items():
-            trend = get_trend(adk, astate["outcome_label"], 180)
-            if not trend: continue
-            arrow = "📈" if trend["delta"] > 0 else "📉"
-            adt   = astate["target_date"]
-            await update.message.reply_text(
-                f"📊 *{adt.strftime('%d.%m')} `{astate['outcome_label']}`*\n"
-                f"{arrow} {trend['first']}% → *{trend['last']}%* ({trend['delta']:+.1f}%)\n"
-                f"`{trend['spark']}`",
-                parse_mode="Markdown")
+            await update.message.reply_text("⚠️ Немає активних позицій.")
+            return
+        await update.message.reply_text(
+            f"⚠️ Немає позиції на {dt.strftime('%d.%m.%Y')}. Показую всі активні:",
+            parse_mode="Markdown")
+        await _send_all_trends(update, active)
         return
+
+    # Одна конкретна позиція
     trend = get_trend(dk, state["outcome_label"], 180)
-    if not trend: await update.message.reply_text("📊 Мало даних (< 2 точок)."); return
-    arrow = "📈" if trend["delta"] > 0 else "📉"
+    if not trend:
+        await update.message.reply_text(
+            f"📊 Мало даних для {dt.strftime('%d.%m')} `{state['outcome_label']}` (< 2 точок).\n"
+            f"Дані накопичуються кожні 2 хв після відкриття позиції.",
+            parse_mode="Markdown")
+        return
+
+    arrow  = "📈" if trend["delta"] > 0 else ("📉" if trend["delta"] < 0 else "➡️")
     mo_str = ""
     if abs(trend["momentum"]) >= MOMENTUM_THRESHOLD:
-        mo = "🚀" if trend["momentum"] > 0 else "💥"
+        mo     = "🚀" if trend["momentum"] > 0 else "💥"
         mo_str = f"\n{mo} *Momentum 30хв: {trend['momentum']:+.1f}%*"
+
     await update.message.reply_text(
         f"📊 *Тренд {dt.strftime('%d.%m')} `{state['outcome_label']}`*\n\n"
         f"{arrow} {trend['first']}% → *{trend['last']}%* ({trend['delta']:+.1f}% / {trend['minutes']}хв)\n"
         f"Точок: {trend['n']}\n\n`{trend['spark']}`{mo_str}",
         parse_mode="Markdown", reply_markup=main_keyboard())
+
+
+async def _send_all_trends(update: Update, active: dict) -> None:
+    """Надсилає тренди всіх активних позицій."""
+    sent = 0
+    for adk, astate in sorted(active.items()):
+        adt   = astate["target_date"]
+        lbl   = astate["outcome_label"]
+        trend = get_trend(adk, lbl, 180)
+
+        if not trend:
+            await update.message.reply_text(
+                f"📊 *{adt.strftime('%d.%m')}{_days_label(adt)} `{lbl}`*\n"
+                f"_Мало даних — накопичуються кожні 2 хв_",
+                parse_mode="Markdown")
+            sent += 1
+            continue
+
+        arrow  = "📈" if trend["delta"] > 0 else ("📉" if trend["delta"] < 0 else "➡️")
+        mo_str = ""
+        if abs(trend["momentum"]) >= MOMENTUM_THRESHOLD:
+            mo     = "🚀" if trend["momentum"] > 0 else "💥"
+            mo_str = f"\n{mo} *Momentum 30хв: {trend['momentum']:+.1f}%*"
+
+        buy    = astate["buy_pct"]
+        roi_str = ""
+        if isinstance(trend["last"], float) and isinstance(buy, float) and buy > 0:
+            roi     = round((trend["last"] / buy - 1) * 100, 1)
+            roi_str = f" │ ROI {roi:+.1f}%"
+
+        await update.message.reply_text(
+            f"📊 *{adt.strftime('%d.%m')}{_days_label(adt)} `{lbl}`*\n\n"
+            f"{arrow} {trend['first']}% → *{trend['last']}%*"
+            f" ({trend['delta']:+.1f}% / {trend['minutes']}хв){roi_str}\n"
+            f"Точок: {trend['n']}\n\n`{trend['spark']}`{mo_str}",
+            parse_mode="Markdown", reply_markup=main_keyboard())
+        sent += 1
+
+    if sent == 0:
+        await update.message.reply_text("📊 Немає даних для жодної позиції.")
 
 
 async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
