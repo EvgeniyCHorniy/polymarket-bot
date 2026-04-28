@@ -530,8 +530,14 @@ def _parse_date_raw(args: list, allow_past: bool = False) -> tuple[datetime | No
         else:
             t = datetime.utcnow() + timedelta(days=1)  # завтра для /check
         return t.replace(hour=0, minute=0, second=0, microsecond=0), None
-    raw = args[0].strip().replace("/", ".")
+    raw_lower = args[0].strip().lower()
     now = datetime.utcnow()
+    # Ключові слова
+    if raw_lower in ("today", "сьогодні", "0"):
+        return now.replace(hour=0, minute=0, second=0, microsecond=0), None
+    if raw_lower in ("tomorrow", "завтра", "1"):
+        return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0), None
+    raw = args[0].strip().replace("/", ".")
     patterns = [
         (r"^(\d{1,2})\.(\d{1,2})$",          lambda m: (int(m[1]), int(m[2]), now.year)),
         (r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$",  lambda m: (int(m[1]), int(m[2]), int(m[3]))),
@@ -655,9 +661,8 @@ def fmt_polymarket(dt: datetime, outcomes: dict,
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🔍 Прогноз завтра"),   KeyboardButton("📅 Прогноз 2 дні")],
-        [KeyboardButton("📊 Polymarket завтра"), KeyboardButton("📈 Мої позиції")],
-        [KeyboardButton("🌤 Погода завтра"),     KeyboardButton("📉 Тренд цін")],
+        [KeyboardButton("📅 Сьогодні"),          KeyboardButton("🔍 Завтра"),      KeyboardButton("📅 Після завтра")],
+        [KeyboardButton("📊 Polymarket завтра"), KeyboardButton("📈 Мої позиції"), KeyboardButton("📉 Тренд цін")],
         [KeyboardButton("📋 Брифінг"),           KeyboardButton("❓ Допомога")],
     ], resize_keyboard=True)
 
@@ -1227,14 +1232,21 @@ async def job_forecast_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
     Якщо прогноз змінився на >= 1°C — надсилає алерт.
     Не залежить від /check — працює автономно.
     """
+    now_dt = datetime.utcnow()
     active_dates = {
         state["target_date"]
         for state in monitoring.values()
         if state.get("active")
+        # Включаємо сьогодні і майбутні (>= today)
+        and state["target_date"].date() >= now_dt.date()
     }
 
     if not active_dates:
         return
+
+    logger.info("forecast_monitor: checking %d dates: %s",
+                len(active_dates),
+                [d.strftime("%d.%m") for d in active_dates])
 
     for dt in active_dates:
         try:
@@ -1288,8 +1300,14 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     cid  = update.effective_chat.id
 
-    if text == "🔍 Прогноз завтра":
-        await _send_full_report(context.bot, tomorrow, cid, "🔍 Прогноз")
+    if text == "📅 Сьогодні":
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        await _send_full_report(context.bot, today, cid, "📅 Сьогодні")
+    elif text in ("🔍 Завтра", "🔍 Прогноз завтра"):
+        await _send_full_report(context.bot, tomorrow, cid, "🔍 Завтра")
+    elif text == "📅 Після завтра":
+        day_after = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await _send_full_report(context.bot, day_after, cid, "📅 Після завтра")
     elif text == "📅 Прогноз 2 дні":
         await update.message.reply_text("⏳ Збираю дані для 2 днів…")
         for days in (1, 2):
@@ -1384,10 +1402,10 @@ def main() -> None:
     jq.run_daily(job_market_scan,      time=kyiv_9.timetz(),   name="market_scan_9")
     jq.run_daily(job_daily_14,         time=kyiv_14.timetz(),  name="daily_14")
     jq.run_repeating(monitor_job,          interval=120,        first=15,   name="price_monitor")
-    jq.run_repeating(job_forecast_monitor, interval=3*60*60,    first=60,   name="forecast_monitor")  # кожні 3 год
+    jq.run_repeating(job_forecast_monitor, interval=30*60,      first=60,   name="forecast_monitor")  # кожні 3 год
 
     start_keep_alive()
-    logger.info("Bot v4 | 07:30 briefing | 09:00 scan | 14:00 daily | price 2min | forecast 3h")
+    logger.info("Bot v4 | 07:30 briefing | 09:00 scan | 14:00 daily | price 2min | forecast 30min")
     app.run_polling()
 
 
