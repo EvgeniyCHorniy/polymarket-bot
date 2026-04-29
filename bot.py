@@ -617,20 +617,26 @@ def _days_label(dt: datetime) -> str:
 #  FORMATTERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fmt_weather(dt: datetime, fc: dict) -> str:
-    lines = [f"🌡 *Прогноз EGLC — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
-             "*3 моделі → погодинний max → wx поправка → EGLC bias:*"]
+def fmt_weather(dt: datetime, fc: dict, city: str = "london") -> str:
+    cfg     = CITIES.get(city, CITIES["london"])
+    station = cfg["station"]
+    emoji   = cfg["emoji"]
+    name    = cfg["name"]
+    lines = [
+        f"🌡 *Прогноз {emoji} {name} ({station}) — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
+        f"*3 моделі → погодинний max → {station} bias:*",
+    ]
     for s in fc["sources"]:
-        out = f" ⚠️ аутлаєр Δ{s['outlier_delta']}°C" if s.get("outlier") else ""
-        bias_str = f"+{s['bias']:.1f}" if s['bias'] >= 0 else f"{s['bias']:.1f}"
+        out      = f" ⚠️ аутлаєр Δ{s['outlier_delta']}°C" if s.get("outlier") else ""
+        bias_str = f"+{s['bias']:.1f}" if s["bias"] >= 0 else f"{s['bias']:.1f}"
         lines.append(
             f"  ▸ *{s['source']}*: {s['temp_max']:.1f}°C"
             f" ☁️{s['cloud']:.0f}% 💨{s['wind']:.0f}км/г"
-            f" → EGLC bias:{bias_str} → *{s['corrected']:.1f}°C*{out}"
+            f" → {station} bias:{bias_str} → *{s['corrected']:.1f}°C*{out}"
         )
         lines.append(f"     _{s['accuracy']}_")
     lines.append(
-        f"\n📍 *EGLC прогноз:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
+        f"\n📍 *{station} прогноз:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
     )
     lines.append(
         f"   _(зваж: {fc['weighted_avg']:.1f} │ медіана: {fc['median']:.1f}"
@@ -643,8 +649,10 @@ def fmt_weather(dt: datetime, fc: dict) -> str:
 def fmt_polymarket(dt: datetime, outcomes: dict,
                    tgt_lbl: str | None, tgt_pct: float | None,
                    link: str, forecast_temp: int | None = None,
-                   trend: dict | None = None) -> str:
-    lines = ["\n📊 *Polymarket — Highest Temp London:*"]
+                   trend: dict | None = None,
+                   city: str = "london") -> str:
+    cfg_name = CITIES.get(city, CITIES["london"])["name"]
+    lines = [f"\n📊 *Polymarket — Highest Temp {cfg_name}:*"]
     if outcomes:
         for lbl, pct in sorted(outcomes.items(), key=lambda x: -x[1])[:5]:
             mark = " ◀️ *прогноз*" if lbl == tgt_lbl else ""
@@ -728,14 +736,14 @@ async def _send_full_report(bot: Bot, dt: datetime,
                 f"Перевір позиції: /positions"
             )
         )
-    _, markets, link = get_polymarket_data(dt)
+    _, markets, link = get_polymarket_data(dt, city)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
     dk    = _date_key(dt)
     trend = get_trend(dk, tgt_lbl) if tgt_lbl else None
-    msg = (f"*{label} {city_cfg['emoji']} {city_cfg['name']} — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n\n"
-           + fmt_weather(dt, fc) + "\n"
-           + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"], trend))
+    msg = (f"*{label} — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n\n"
+           + fmt_weather(dt, fc, city) + "\n"
+           + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"], trend, city))
     if tgt_pct is not None and tgt_pct < BUY_MAX_PCT:
         mn  = re.search(r"(\d+)", tgt_lbl or "")
         num = mn.group(1) if mn else "??"
