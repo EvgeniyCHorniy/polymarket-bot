@@ -840,7 +840,7 @@ async def job_morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
         for dk, state in sorted(active.items()):
             dt  = state["target_date"]
             lbl = state["outcome_label"]
-            _, markets, _ = get_polymarket_data(dt)
+            _, markets, _ = get_polymarket_data(dt, state.get("city", "london"))
             outcomes = parse_all_outcomes(markets) if markets else {}
             cur  = outcomes.get(lbl, "?")
             buy  = state["buy_pct"]
@@ -855,7 +855,8 @@ async def job_morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Нагадування записати факт
     yesterday = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    _, y_mkts, _ = get_polymarket_data(yesterday)
+    # Перевіряємо обидва міста для нагадування /actual
+    y_mkts = any(get_polymarket_data(yesterday, c)[1] for c in CITIES)
     if y_mkts:
         await context.bot.send_message(
             chat_id=CHAT_ID, parse_mode="Markdown",
@@ -879,7 +880,8 @@ async def job_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     found = []
     for days_ahead in range(1, 5):
         dt = (now + timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
-        event, markets, link = get_polymarket_data(dt)
+        for scan_city in CITIES:
+            event, markets, link = get_polymarket_data(dt, scan_city)
         if not event or not markets: continue
         outcomes    = parse_all_outcomes(markets)
         buy_signals = [(lbl, pct) for lbl, pct in outcomes.items() if pct < BUY_MAX_PCT]
@@ -1015,7 +1017,8 @@ async def cmd_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if err: await update.message.reply_text(err, parse_mode="Markdown"); return
     fc = compute_forecast(dt)
     if "error" in fc: await update.message.reply_text(f"⚠️ {fc['error']}"); return
-    _, markets, link = get_polymarket_data(dt)
+    poll_city = getattr(context, "_city", None) or selected_city.get(update.effective_chat.id, "london")
+    _, markets, link = get_polymarket_data(dt, poll_city)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
     dk = _date_key(dt); trend = get_trend(dk, tgt_lbl) if tgt_lbl else None
@@ -1305,7 +1308,8 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for dk, state in sorted(active.items(),
                              key=lambda x: (x[1].get("city","london"), x[1]["target_date"])):
         dt = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
-        _, markets, link = get_polymarket_data(dt)
+        pos_city = state.get("city", "london")
+        _, markets, link = get_polymarket_data(dt, pos_city)
         outcomes = parse_all_outcomes(markets) if markets else {}
         cur = outcomes.get(lbl, "?"); trend = get_trend(dk, lbl, 60)
         roi_str = ""
@@ -1593,7 +1597,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not state or not state.get("active"):
             await query.edit_message_text("⚠️ Позиція вже закрита."); return
         dt  = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
-        _, markets, _ = get_polymarket_data(dt)
+        cb_city = state.get("city", "london")
+        _, markets, _ = get_polymarket_data(dt, cb_city)
         outcomes = parse_all_outcomes(markets) if markets else {}
         cur = outcomes.get(lbl, "?"); state["active"] = False
         profit = ""
