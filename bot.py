@@ -371,26 +371,35 @@ def fetch_dwd_icon(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, t
 
 
 def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London") -> dict | None:
-    """UK Met Office — 2 км, офіційна британська служба."""
+    """
+    UK Met Office via Open-Meteo.
+    Правильний endpoint: https://api.open-meteo.com/v1/ukmo
+    Моделі: ukmo_global_deterministic_10km (глобальна) + ukmo_uk_deterministic_2km (2km UK/Ireland).
+    Примітка: UK 2km доступна тільки для UK/Ireland, тому для Munich fallback на global.
+    """
     ds = dt.strftime("%Y-%m-%d")
-    # Пробуємо два можливих endpoint
-    for url, params in [
-        ("https://api.open-meteo.com/v1/ukmo_seamless", {
+
+    # Для UK координат — пробуємо 2km модель спочатку
+    # Для інших країн — відразу global
+    uk_bounds = (49.5 <= lat <= 61.0 and -8.5 <= lon <= 2.0)
+
+    urls_to_try = []
+    if uk_bounds:
+        urls_to_try.append(("https://api.open-meteo.com/v1/ukmo", {"models": "ukmo_uk_deterministic_2km"}))
+    urls_to_try.append(("https://api.open-meteo.com/v1/ukmo", {"models": "ukmo_global_deterministic_10km"}))
+
+    for url, extra_params in urls_to_try:
+        params = {
             "latitude": lat, "longitude": lon,
             "hourly": "temperature_2m,cloud_cover,windspeed_10m",
             "timezone": tz, "start_date": ds, "end_date": ds,
-        }),
-        ("https://api.open-meteo.com/v1/forecast", {
-            "latitude": lat, "longitude": lon,
-            "hourly": "temperature_2m,cloud_cover,windspeed_10m",
-            "timezone": tz, "start_date": ds, "end_date": ds,
-            "models": "ukmo_seamless",
-        }),
-    ]:
+            **extra_params,
+        }
         data = _safe_get(url, params=params)
         if data:
             result = _build_source("UK Met Office", data, ds)
-            if result: return result
+            if result:
+                return result
     return None
 
 
