@@ -730,7 +730,7 @@ async def _send_full_report(bot: Bot, dt: datetime,
         await bot.send_message(
             chat_id=chat_id, parse_mode="Markdown",
             text=(
-                f"{direction} *Прогноз змінився — {dt.strftime('%d.%m.%Y')}*\n\n"
+                f"{direction} *{city_cfg['emoji']} {city_cfg['name']} — прогноз змінився {dt.strftime('%d.%m.%Y')}*\n\n"
                 f"Було: *{prev_final:.1f}°C* → Стало: *{fc['final_temp']:.1f}°C*\n"
                 f"Різниця: {fc['final_temp']-prev_final:+.1f}°C\n\n"
                 f"Перевір позиції: /positions"
@@ -739,7 +739,7 @@ async def _send_full_report(bot: Bot, dt: datetime,
     _, markets, link = get_polymarket_data(dt, city)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
-    dk    = _date_key(dt)
+    dk    = f"{city}_{_date_key(dt)}"  # city prefix для trend lookup
     trend = get_trend(dk, tgt_lbl) if tgt_lbl else None
     msg = (f"*{label} — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n\n"
            + fmt_weather(dt, fc, city) + "\n"
@@ -909,57 +909,57 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "━━━ 🌍 ВИБІР МІСТА ━━━",
         "Кнопки: 🇬🇧 London / 🇩🇪 Munich",
-        "Вибране місто діє для всіх кнопок.",
-        "Або вказуй явно в команді:",
-        "  /check london 29.04",
-        "  /check munich 29.04",
-        "Міста: london, munich",
+        "Або вказуй місто явно в команді.",
+        "Доступні міста: london, munich",
         "",
         "━━━ 📊 ПРОГНОЗ ━━━",
         "Кнопки: Сьогодні / Завтра / Після завтра",
-        "/check [місто] [DD.MM] — прогноз + Polymarket",
-        "  /check — завтра London (за замовч.)",
+        "/check [місто] [DD.MM]",
+        "  /check — завтра (поточне місто)",
         "  /check today — сьогодні",
-        "  /check munich 30.04 — Munich 30 квітня",
-        "/check2 — завтра + після завтра разом",
+        "  /check munich 30.04",
+        "/check2 — завтра + після завтра",
         "/forecast [місто] [DD.MM] — лише погода",
         "/poll [місто] [DD.MM] — лише Polymarket",
         "",
         "━━━ 💰 ТОРГІВЛЯ ━━━",
         "Формат: /buy [місто] <темп> [DD.MM] [опції]",
         "",
-        "Приклади London:",
-        "  /buy 17 — 17°C завтра London",
-        "  /buy 17 29.04 — London 29 квітня",
-        "  /buy london 17 29.04 — явно London",
+        "  /buy 17 — London, завтра, 17C",
+        "  /buy 17 30.04 — London, 30 квітня",
+        "  /buy london 17 30.04 — явно London",
+        "  /buy munich 20 30.04 — Munich",
         "",
-        "Приклади Munich:",
-        "  /buy munich 20 — 20°C завтра Munich",
-        "  /buy munich 20 29.04 — Munich 29 квітня",
-        "",
-        "Опції (додаються після дати):",
         "  --price 35.5 — ціна за якою купив",
-        "  --stop 20    — стоп-лос (алерт при падінні до 20%)",
-        "  --tp 65      — тейк-профіт (алерт при досягненні 65%)",
+        "  --stop 20    — стоп-лос при падінні до 20%",
+        "  --tp 65      — тейк-профіт при 65%",
         "",
         "Повний приклад:",
-        "  /buy munich 20 29.04 --price 29 --stop 15 --tp 60",
+        "  /buy munich 20 30.04 --price 29 --stop 15 --tp 60",
         "",
-        "Закрити позиції:",
-        "  /sell — закрити єдину",
-        "  /sell 29.04 — конкретну дату",
-        "  /sell all — всі",
+        "Якщо позиція вже є — бот запропонує оновити ціну.",
+        "Можна тримати кілька температур одночасно:",
+        "  /buy london 17 30.04",
+        "  /buy london 18 30.04  <- окрема позиція!",
         "",
-        "Переглянути:",
-        "  /positions — всі позиції + ROI + тренд",
+        "━━━ 📤 ЗАКРИТТЯ ━━━",
+        "  /sell — закрити єдину активну",
+        "  /sell 30.04 — всі позиції на цю дату",
+        "  /sell 30.04 17 — тільки 17C на 30.04",
+        "  /sell london 30.04 18 — London 18C",
+        "  /sell munich 29.04 20 — Munich 20C",
+        "  /sell all — закрити всі",
+        "",
+        "━━━ 📈 ПЕРЕГЛЯД ━━━",
+        "  /positions — всі активні позиції + ROI",
         "  /trend — тренд цін по всіх позиціях",
-        "  /trend 29.04 — тренд конкретної",
+        "  /trend 30.04 — тренд конкретної дати",
         "",
-        "━━━ 🧠 НАВЧАННЯ БОТА ━━━",
-        "Після дня вводь фактичну температуру EGLC/EDDM:",
+        "━━━ 🧠 НАВЧАННЯ ━━━",
+        "Після дня вводь фактичну температуру:",
         "  /actual 16.5 — факт за вчора",
-        "  /actual 16.5 28.04 — факт за конкретний день",
-        "Бот сам порівняє з прогнозом і накопичить статистику.",
+        "  /actual 16.5 28.04 — за конкретний день",
+        "Бот сам знає свій прогноз і порівняє.",
         "  /history — точність кожної моделі",
         "",
         "━━━ ⏰ АВТОМАТИКА ━━━",
@@ -968,7 +968,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "14:00 — денний звіт на завтра",
         "Кожні 2 хв — моніторинг цін позицій",
         "Кожні 30 хв — перевірка зміни прогнозу",
-        "/briefing — запустити брифінг вручну",
+        "  /briefing — запустити брифінг вручну",
         "",
         "━━━ 🔔 АЛЕРТИ ━━━",
         "Рівні: 40 → 50 → 60 → 70 → 80 → 90%",
@@ -980,7 +980,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "━━━ 📡 СТАНЦІЇ ━━━",
         "🇬🇧 London: EGLC (London City Airport)",
         "🇩🇪 Munich: EDDM (Munich Airport)",
-        "Джерело: Wunderground / DWD",
         "Моделі: ECMWF + DWD ICON + UK Met Office",
     ]
     await update.message.reply_text(
@@ -1190,22 +1189,22 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         debug.append(f"\n🔗 {link}")
         await update.message.reply_text("\n".join(debug), parse_mode="Markdown"); return
 
-    dk = f"{buy_city}_{_date_key(dt)}"  # city prefix щоб London і Munich не конфліктували
+    dk = f"{buy_city}_{_date_key(dt)}_{temp_int}"  # city+date+temp = унікальна позиція
     if monitoring.get(dk, {}).get("active"):
-        await update.message.reply_text(
-            f"⚠️ Попередня позиція `{monitoring[dk]['outcome_label']}` зупинена.",
-            parse_mode="Markdown")
+        existing = monitoring[dk]
+        if buy_price is not None:
+            existing["buy_pct"] = buy_price
+            await update.message.reply_text(
+                f"✅ Ціну оновлено: `{lbl}` тепер @ *{buy_price}%*",
+                parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                f"ℹ️ Позиція `{lbl}` вже активна @ {existing['buy_pct']}%.\n"
+                f"Щоб оновити ціну покупки:\n"
+                f"`/buy {buy_city} {temp_int} {dt.strftime('%d.%m')} --price <ціна>`",
+                parse_mode="Markdown")
+        return
 
-    already = [l for l in ALERT_LEVELS if pct is not None and pct >= l]
-    pending = [l for l in ALERT_LEVELS if l not in already]
-    monitoring[dk] = {
-        "active": True, "target_date": dt, "outcome_label": lbl, "temp_int": temp_int,
-        "city": buy_city,
-        "buy_pct": buy_price if buy_price is not None else pct,
-        "alerted": already, "poly_link": link,
-        "stop_loss": stop_loss, "take_profit": take_profit,
-        "tp_alerted": False, "sl_alerted": False, "alerted_mom": [],
-    }
     sl_str = f"\n🛑 Стоп-лос: *{stop_loss}%*" if stop_loss else ""
     tp_str = f"\n🎯 Тейк-профіт: *{take_profit}%*" if take_profit else ""
     recorded_pct = buy_price if buy_price is not None else pct
@@ -1232,14 +1231,35 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if arg == "all":
         to_close = list(active.keys())
     elif arg:
-        dt_parsed, err = parse_target_date(context.args)
+        args_sell = list(context.args)
+        # Парсимо місто якщо є
+        sell_city = None
+        if args_sell and args_sell[0].lower() in CITIES:
+            sell_city = args_sell.pop(0).lower()
+        # Парсимо дату
+        dt_parsed, err = parse_target_date(args_sell[:1] if args_sell else [])
         if err or dt_parsed is None:
-            await update.message.reply_text("❌ `/sell DD.MM` або `/sell all`", parse_mode="Markdown"); return
-        dk = _date_key(dt_parsed)
-        if dk not in active:
-            dates = ", ".join(s["target_date"].strftime("%d.%m") for s in active.values())
-            await update.message.reply_text(f"⚠️ Немає позиції. Активні: {dates}"); return
-        to_close = [dk]
+            await update.message.reply_text("❌ `/sell DD.MM [temp]` або `/sell all`", parse_mode="Markdown"); return
+        date_str = _date_key(dt_parsed)
+        # Парсимо температуру якщо є
+        temp_sell = None
+        if len(args_sell) > 1:
+            try: temp_sell = int(args_sell[1])
+            except: pass
+        # Знаходимо відповідні позиції
+        if temp_sell is not None and sell_city:
+            to_close = [k for k in active if k == f"{sell_city}_{date_str}_{temp_sell}"]
+        elif temp_sell is not None:
+            to_close = [k for k in active if k.endswith(f"_{date_str}_{temp_sell}")]
+        elif sell_city:
+            to_close = [k for k in active if k.startswith(f"{sell_city}_{date_str}")]
+        else:
+            to_close = [k for k in active if f"_{date_str}_" in k]
+        if not to_close:
+            summary = ", ".join(
+                f"{s.get('city','?')}/{s['target_date'].strftime('%d.%m')}/{s['outcome_label']}"
+                for s in active.values())
+            await update.message.reply_text(f"⚠️ Немає позиції. Активні: {summary}"); return
     else:
         if len(active) == 1: to_close = list(active.keys())
         else:
@@ -1249,7 +1269,8 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = []
     for dk in to_close:
         state = monitoring[dk]; dt = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
-        _, markets, _ = get_polymarket_data(dt)
+        m_city = state.get("city", "london")
+        _, markets, _ = get_polymarket_data(dt, m_city)
         outcomes = parse_all_outcomes(markets) if markets else {}
         cur = outcomes.get(lbl)
         state["active"] = False
@@ -1267,7 +1288,8 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("📊 Немає позицій.\n`/buy <temp>`",
                                         parse_mode="Markdown", reply_markup=main_keyboard()); return
     lines = [f"📊 *Активні позиції ({len(active)}):*\n"]
-    for dk, state in sorted(active.items()):
+    for dk, state in sorted(active.items(),
+                             key=lambda x: (x[1].get("city","london"), x[1]["target_date"])):
         dt = state["target_date"]; lbl = state["outcome_label"]; buy = state["buy_pct"]
         _, markets, link = get_polymarket_data(dt)
         outcomes = parse_all_outcomes(markets) if markets else {}
@@ -1441,26 +1463,40 @@ async def job_forecast_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
             if changed:
                 direction = "🔺" if fc["final_temp"] > prev_final else "🔻"
                 diff = fc["final_temp"] - prev_final
+                city_cfg = CITIES.get(m_city, CITIES["london"])
 
-                dk    = _date_key(dt)
-                state = monitoring.get(dk, {})
-                pos_info = ""
-                if state.get("active"):
-                    lbl = state["outcome_label"]
-                    pos_info = ("\n\U0001f4ca Твоя позиція: `"
-                               + lbl + "` @ " + str(state["buy_pct"]) + "%")
+                # Знаходимо ВСІ активні позиції для цього міста і дати
+                date_str = _date_key(dt)
+                affected = [
+                    s for k, s in monitoring.items()
+                    if s.get("active")
+                    and k.startswith(f"{m_city}_{date_str}")
+                ]
+
+                pos_lines = ""
+                if affected:
+                    pos_parts = []
+                    for s in affected:
+                        lbl = s["outcome_label"]
+                        buy = s["buy_pct"]
+                        # Чи впливає зміна прогнозу на цю позицію?
+                        impact = ""
+                        if fc["final_int"] != round(prev_final):
+                            impact = " ⚠️ прогноз змінив outcome!"
+                        pos_parts.append(f"  `{lbl}` @ {buy}%{impact}")
+                    pos_lines = "\n\n📊 *Твої позиції:*\n" + "\n".join(pos_parts)
 
                 sources_str = ", ".join(
                     s["source"] + " " + f"{s['temp_max']:.1f}°C"
                     for s in fc["sources"]
                 )
                 alert_text = (
-                    f"{direction} *Прогноз змінився — {dt.strftime('%d.%m.%Y')}*\n\n"
+                    f"{direction} *{city_cfg['emoji']} {city_cfg['name']} — прогноз змінився {dt.strftime('%d.%m.%Y')}*\n\n"
                     f"Було: *{prev_final:.1f}°C* → Стало: *{fc['final_temp']:.1f}°C*\n"
                     f"Зміна: *{diff:+.1f}°C*\n"
                     f"Джерела: {sources_str}"
-                    + pos_info
-                    + "\n\n/positions — переглянути позиції"
+                    + pos_lines
+                    + "\n\n/positions — всі позиції"
                 )
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
@@ -1468,8 +1504,8 @@ async def job_forecast_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     text=alert_text,
                 )
                 logger.info(
-                    "Forecast change alert: %s %.1f→%.1f°C",
-                    dt.strftime("%Y-%m-%d"), prev_final, fc["final_temp"]
+                    "Forecast change %s %s: %.1f→%.1f°C",
+                    m_city, dt.strftime("%Y-%m-%d"), prev_final, fc["final_temp"]
                 )
         except Exception as e:
             logger.error("forecast_monitor error for %s: %s", dt.date(), e)
