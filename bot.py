@@ -1205,6 +1205,20 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown")
         return
 
+    # Розраховуємо alerted рівні відносно ПОТОЧНОЇ ціни ринку
+    already = [l for l in ALERT_LEVELS if pct is not None and pct >= l]
+    pending = [l for l in ALERT_LEVELS if l not in already]
+
+    monitoring[dk] = {
+        "active": True, "target_date": dt, "outcome_label": lbl, "temp_int": temp_int,
+        "city": buy_city,
+        "buy_pct": buy_price if buy_price is not None else pct,
+        "alerted": already, "poly_link": link,
+        "stop_loss": stop_loss, "take_profit": take_profit,
+        "tp_alerted": False, "sl_alerted": False, "alerted_mom": [],
+    }
+
+
     sl_str = f"\n🛑 Стоп-лос: *{stop_loss}%*" if stop_loss else ""
     tp_str = f"\n🎯 Тейк-профіт: *{take_profit}%*" if take_profit else ""
     recorded_pct = buy_price if buy_price is not None else pct
