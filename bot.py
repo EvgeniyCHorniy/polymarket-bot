@@ -1300,7 +1300,7 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🔍 Шукаю *{temp_int}°C* на {dt.strftime('%d.%m.%Y')}…", parse_mode="Markdown")
 
-    buy_city = locals().get("buy_city", "london")
+    # buy_city вже встановлено вище з аргументів команди
     _, markets, link = get_polymarket_data(dt, buy_city)
     outcomes = parse_all_outcomes(markets) if markets else {}
     lbl, pct = find_outcome_for_temp(outcomes, temp_int) if outcomes else (None, None)
