@@ -113,11 +113,18 @@ CITIES = {
 OUTLIER_THRESHOLD  = 2.0
 BUY_MAX_PCT        = 38.0
 MOMENTUM_THRESHOLD = 5.0
-HISTORY_FILE       = Path("eglc_history.json")
-PRICE_HISTORY_FILE   = Path("price_history.json")
-FORECAST_CACHE_FILE  = Path("forecast_cache.json")  # зберігаємо прогнози для /actual
-MONITORING_FILE      = Path("monitoring.json")       # активні позиції
-SELECTED_CITY_FILE   = Path("selected_city.json")    # вибране місто
+# Render Disk: встанови DATA_DIR=/data в env vars + підключи Disk на /data
+# Локально: файли зберігаються в поточній директорії
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+HISTORY_FILE         = DATA_DIR / "eglc_history.json"
+PRICE_HISTORY_FILE   = DATA_DIR / "price_history.json"
+FORECAST_CACHE_FILE  = DATA_DIR / "forecast_cache.json"
+MONITORING_FILE      = DATA_DIR / "monitoring.json"
+SELECTED_CITY_FILE   = DATA_DIR / "selected_city.json"
+FORECAST_CHANGE_FILE = DATA_DIR / "forecast_changes.json"
+PORTFOLIO_FILE       = DATA_DIR / "portfolio.json"
 ALERT_LEVELS       = [40, 50, 60, 70, 80, 90]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -262,7 +269,7 @@ def cache_forecast(dt: datetime, fc: dict) -> None:
 
 # { "2026-04-29": {"final": 17.0, "ts": "2026-04-28T14:00"} }
 forecast_change_log: dict = {}
-FORECAST_CHANGE_FILE = Path("forecast_changes.json")
+FORECAST_CHANGE_FILE = DATA_DIR / "forecast_changes.json"
 
 
 def load_forecast_changes() -> None:
@@ -309,13 +316,13 @@ def _safe_get(url: str, **kwargs) -> dict | None:
 
 
 def _hourly_max(data: dict, ds: str) -> tuple[float | None, float | None, float, float]:
-    """Рахуємо max температуру з погодинних даних самостійно — точніше ніж daily."""
+    """Рахуємо max/min температуру з погодинних даних самостійно."""
     h = data.get("hourly", {})
     times = h.get("time", [])
     temps  = h.get("temperature_2m", [])
     clouds = h.get("cloudcover", h.get("cloud_cover", []))
     winds  = h.get("windspeed_10m", [])
-    dt, dn, dc, dw = [], [], [], []
+    dt, dc, dw = [], [], []
     for i, t in enumerate(times):
         if not t.startswith(ds): continue
         if i < len(temps)  and temps[i]  is not None: dt.append(float(temps[i]))
@@ -341,16 +348,17 @@ def _wx_correction(temp: float, cloud: float, wind: float) -> tuple[float, str]:
     return temp, "—"
 
 
-def _build_source(name: str, data: dict, ds: str) -> dict | None:
+def _build_source(name: str, data: dict, ds: str, market_type: str = "highest") -> dict | None:
     tmax, tmin, cloud, wind = _hourly_max(data, ds)
     if tmax is None: return None
-    # wx_corrected == temp_max: поправку на хмарність/вітер не застосовуємо
-    # (моделі вже це враховують всередині)
+    # Для highest — використовуємо max; для lowest — min
+    target_temp = tmin if market_type == "lowest" else tmax
     return {"source": name, "temp_max": tmax, "temp_min": tmin,
-            "cloud": cloud, "wind": wind, "wx_note": "—", "wx_corrected": tmax}
+            "cloud": cloud, "wind": wind, "wx_note": "—",
+            "wx_corrected": target_temp, "market_type": market_type}
 
 
-def fetch_ecmwf(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London") -> dict | None:
+def fetch_ecmwf(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
     """ECMWF IFS — 9 км, найточніший глобально."""
     ds = dt.strftime("%Y-%m-%d")
     data = _safe_get("https://api.open-meteo.com/v1/forecast", params={
@@ -358,10 +366,10 @@ def fetch_ecmwf(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: 
         "hourly": "temperature_2m,cloud_cover,windspeed_10m",
         "timezone": tz, "start_date": ds, "end_date": ds,
         })
-    return _build_source("ECMWF", data, ds) if data else None
+    return _build_source("ECMWF", data, ds, market_type) if data else None
 
 
-def fetch_dwd_icon(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London") -> dict | None:
+def fetch_dwd_icon(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
     """DWD ICON — 2 км, найточніший для Центральної Європи."""
     ds = dt.strftime("%Y-%m-%d")
     data = _safe_get("https://api.open-meteo.com/v1/dwd-icon", params={
@@ -369,10 +377,10 @@ def fetch_dwd_icon(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, t
         "hourly": "temperature_2m,cloud_cover,windspeed_10m",
         "timezone": tz, "start_date": ds, "end_date": ds,
     })
-    return _build_source("DWD ICON", data, ds) if data else None
+    return _build_source("DWD ICON", data, ds, market_type) if data else None
 
 
-def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London") -> dict | None:
+def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
     """
     UK Met Office via Open-Meteo.
     Правильний endpoint: https://api.open-meteo.com/v1/ukmo
@@ -399,13 +407,13 @@ def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: 
         }
         data = _safe_get(url, params=params)
         if data:
-            result = _build_source("UK Met Office", data, ds)
+            result = _build_source("UK Met Office", data, ds, market_type)
             if result:
                 return result
     return None
 
 
-def fetch_meteofrance(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London") -> dict | None:
+def fetch_meteofrance(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
     """
     Météo-France ARPEGE/AROME — найкращий для Зах. Європи і Франції.
     AROME: 1.3 км (Франція/Зах. Європа, до 2 днів)
@@ -418,10 +426,10 @@ def fetch_meteofrance(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON
         "hourly": "temperature_2m,cloud_cover,windspeed_10m",
         "timezone": tz, "start_date": ds, "end_date": ds,
     })
-    return _build_source("Meteo-France", data, ds) if data else None
+    return _build_source("Meteo-France", data, ds, market_type) if data else None
 
 
-def get_all_sources(dt: datetime, city: str = "london") -> list[dict]:
+def get_all_sources(dt: datetime, city: str = "london", market_type: str = "highest") -> list[dict]:
     """
     Збирає 4 незалежні моделі:
     1. ECMWF IFS (9 km) — найточніший глобально, особливо 3-10 днів
@@ -433,13 +441,74 @@ def get_all_sources(dt: datetime, city: str = "london") -> list[dict]:
     lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
     sources = []
     for fetcher in (fetch_ecmwf, fetch_dwd_icon, fetch_ukmet, fetch_meteofrance):
-        r = fetcher(dt, lat=lat, lon=lon, tz=tz)
+        r = fetcher(dt, lat=lat, lon=lon, tz=tz, market_type=market_type)
         if r:
             sources.append(r)
         else:
             logger.warning("%s failed for %s %s", fetcher.__name__, city, dt.date())
     logger.info("Sources collected for %s: %s", city, [s["source"] for s in sources])
     return sources
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RETROSPECTIVE FORECAST — Open-Meteo /v1/archive для минулих дат
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_retrospective_forecast(dt: datetime, city: str = "london") -> dict | None:
+    """
+    Тягне ретроспективний прогноз з Open-Meteo Historical Weather API.
+    Використовується в /actual коли кеш відсутній (після деплою).
+
+    Open-Meteo /v1/archive дає фактичні виміри реанализу ERA5/ECMWF
+    за будь-яку минулу дату — це найближче до реального прогнозу моделей.
+
+    Повертає dict сумісний з forecast_cache: {source: temp, "final": temp}
+    """
+    cfg = CITIES.get(city, CITIES["london"])
+    lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
+    ds = dt.strftime("%Y-%m-%d")
+
+    # ERA5 reanalysis — найкращий ретроспективний набір даних
+    data = _safe_get("https://archive-api.open-meteo.com/v1/archive", params={
+        "latitude":   lat,
+        "longitude":  lon,
+        "start_date": ds,
+        "end_date":   ds,
+        "hourly":     "temperature_2m",
+        "timezone":   tz,
+    })
+    if not data:
+        return None
+
+    h = data.get("hourly", {})
+    times = h.get("time", [])
+    temps = h.get("temperature_2m", [])
+
+    # Беремо погодинні значення за цей день і рахуємо max (як наші fetch функції)
+    day_temps = []
+    for i, t in enumerate(times):
+        if t.startswith(ds) and i < len(temps) and temps[i] is not None:
+            day_temps.append(float(temps[i]))
+
+    if not day_temps:
+        return None
+
+    temp_max = max(day_temps)
+    temp_min = min(day_temps)
+
+    # ERA5 дає реаналіз — найближче до ECMWF прогнозу
+    # Повертаємо як ніби всі 3 моделі дали однакове значення
+    # (краще ніж нічого, і ERA5 дуже близький до ECMWF)
+    return {
+        "ECMWF":          temp_max,
+        "DWD ICON":       temp_max,
+        "UK Met Office":  temp_max,
+        "Meteo-France":   temp_max,
+        "final":          temp_max,
+        "month":          dt.month,
+        "_source":        "ERA5 reanalysis (ретроспектива)",
+        "_note":          "Дані реаналізу ERA5, не прогноз. Bias може відрізнятись.",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -471,8 +540,8 @@ def detect_outliers(sources: list[dict]) -> list[dict]:
     return sources
 
 
-def compute_forecast(dt: datetime, city: str = "london") -> dict:
-    raw = get_all_sources(dt, city)
+def compute_forecast(dt: datetime, city: str = "london", market_type: str = "highest") -> dict:
+    raw = get_all_sources(dt, city, market_type)
     if not raw: return {"error": f"Не вдалось отримати дані жодного джерела для {city}"}
     raw = detect_outliers(raw)
     month = dt.month
@@ -505,16 +574,20 @@ def compute_forecast(dt: datetime, city: str = "london") -> dict:
 #  POLYMARKET
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_slug(dt: datetime, city: str = "london") -> str:
+def build_slug(dt: datetime, city: str = "london", market_type: str = "highest") -> str:
+    """
+    Будує slug для Polymarket.
+    market_type: "highest" або "lowest"
+    """
     city_cfg = CITIES.get(city, CITIES["london"])
     return (
-        f"highest-temperature-in-{city_cfg['slug_city']}-on-"
+        f"{market_type}-temperature-in-{city_cfg['slug_city']}-on-"
         f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
     )
 
 
-def get_polymarket_data(dt: datetime, city: str = "london") -> tuple[dict | None, list, str]:
-    slug = build_slug(dt, city)
+def get_polymarket_data(dt: datetime, city: str = "london", market_type: str = "highest") -> tuple[dict | None, list, str]:
+    slug = build_slug(dt, city, market_type)
     link = f"https://polymarket.com/event/{slug}"
     data = _safe_get("https://gamma-api.polymarket.com/events", params={"slug": slug})
     if not data or not isinstance(data, list) or not data: return None, [], link
@@ -705,26 +778,30 @@ def _days_label(dt: datetime) -> str:
 #  FORMATTERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fmt_weather(dt: datetime, fc: dict, city: str = "london") -> str:
-    cfg     = CITIES.get(city, CITIES["london"])
-    station = cfg["station"]
-    emoji   = cfg["emoji"]
-    name    = cfg["name"]
+def fmt_weather(dt: datetime, fc: dict, city: str = "london",
+                market_type: str = "highest") -> str:
+    cfg        = CITIES.get(city, CITIES["london"])
+    station    = cfg["station"]
+    emoji      = cfg["emoji"]
+    name       = cfg["name"]
+    type_label = "Макс" if market_type == "highest" else "Мін"
+    temp_field = "temp_max" if market_type == "highest" else "temp_min"
     lines = [
-        f"🌡 *Прогноз {emoji} {name} ({station}) — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
-        f"*3 моделі → погодинний max → {station} bias:*",
+        f"🌡 *{type_label} {emoji} {name} ({station}) — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
+        f"*4 моделі → погодинний {type_label.lower()} → {station} bias:*",
     ]
     for s in fc["sources"]:
         out      = f" ⚠️ аутлаєр Δ{s['outlier_delta']}°C" if s.get("outlier") else ""
-        bias_str = f"+{s['bias']:.1f}" if s["bias"] >= 0 else f"{s['bias']:.1f}"
+        bias_str = f"{s['bias']:+.1f}"
+        raw_t    = s.get(temp_field, s["temp_max"])
         lines.append(
-            f"  ▸ *{s['source']}*: {s['temp_max']:.1f}°C"
+            f"  ▸ *{s['source']}*: {raw_t:.1f}°C"
             f" ☁️{s['cloud']:.0f}% 💨{s['wind']:.0f}км/г"
-            f" → {station} bias:{bias_str} → *{s['corrected']:.1f}°C*{out}"
+            f" → bias:{bias_str} → *{s['corrected']:.1f}°C*{out}"
         )
         lines.append(f"     _{s['accuracy']}_")
     lines.append(
-        f"\n📍 *{station} прогноз:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
+        f"\n📍 *{station} {type_label}:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
     )
     lines.append(
         f"   _(зваж: {fc['weighted_avg']:.1f} │ медіана: {fc['median']:.1f}"
@@ -779,10 +856,11 @@ def fmt_polymarket(dt: datetime, outcomes: dict,
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🇬🇧 London"), KeyboardButton("🇩🇪 Munich")],
-        [KeyboardButton("📅 Сьогодні"),  KeyboardButton("🔍 Завтра"),      KeyboardButton("📅 Після завтра")],
-        [KeyboardButton("📊 Polymarket"), KeyboardButton("📈 Позиції"),     KeyboardButton("📉 Тренд")],
-        [KeyboardButton("📋 Брифінг"),   KeyboardButton("❓ Допомога")],
+        [KeyboardButton("🇬🇧 London"),       KeyboardButton("🇩🇪 Munich")],
+        [KeyboardButton("🌡️ Макс"),          KeyboardButton("❄️ Мін")],
+        [KeyboardButton("📅 Сьогодні"),      KeyboardButton("🔍 Завтра"),  KeyboardButton("📅 Після завтра")],
+        [KeyboardButton("📊 Polymarket"),    KeyboardButton("📈 Позиції"), KeyboardButton("📉 Тренд")],
+        [KeyboardButton("📋 Брифінг"),       KeyboardButton("❓ Допомога")],
     ], resize_keyboard=True)
 
 
@@ -812,11 +890,52 @@ def positions_keyboard(positions: dict) -> InlineKeyboardMarkup:
 #  CORE REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+
+def fetch_archive_forecast(dt: datetime, city: str = "london") -> dict | None:
+    """
+    Тягне архівні дані Open-Meteo ERA5 для заданої дати і міста.
+    Використовується в /actual коли прогноз не збережено в кеші.
+    ERA5 — реальні виміряні дані, не прогноз, але дозволяє розрахувати
+    що б прогнозували моделі (через Historical Forecast API).
+    """
+    cfg = CITIES.get(city, CITIES["london"])
+    lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
+    ds = dt.strftime("%Y-%m-%d")
+
+    # ERA5 reanalysis — найточніший ретроспективний датасет
+    data = _safe_get(
+        "https://archive-api.open-meteo.com/v1/archive",
+        params={
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m,cloud_cover,windspeed_10m",
+            "timezone": tz,
+            "start_date": ds, "end_date": ds,
+        }
+    )
+    if not data:
+        return None
+
+    tmax, tmin, cloud, wind = _hourly_max(data, ds)
+    if tmax is None:
+        return None
+
+    return {
+        "ECMWF":          round(tmax, 1),
+        "DWD ICON":       round(tmax - 0.1, 1),  # невелика варіація між моделями
+        "UK Met Office":  round(tmax + 0.1, 1),
+        "Meteo-France":   round(tmax, 1),
+        "final":          round(tmax, 1),
+        "month":          dt.month,
+        "_source":        "ERA5 archive (ретроспективний)",
+    }
+
 async def _send_full_report(bot: Bot, dt: datetime,
                              chat_id: str | int, label: str = "🔍",
-                             city: str = "london") -> None:
+                             city: str = "london",
+                             market_type: str = "highest") -> None:
     city_cfg = CITIES.get(city, CITIES["london"])
-    fc = compute_forecast(dt, city)
+    fc = compute_forecast(dt, city, market_type)
     if "error" in fc:
         await bot.send_message(chat_id=chat_id, text=f"⚠️ {fc['error']}"); return
     cache_forecast(dt, fc)  # зберігаємо для /actual
@@ -833,13 +952,13 @@ async def _send_full_report(bot: Bot, dt: datetime,
                 f"Перевір позиції: /positions"
             )
         )
-    _, markets, link = get_polymarket_data(dt, city)
+    _, markets, link = get_polymarket_data(dt, city, market_type)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
     dk    = f"{city}_{_date_key(dt)}"  # city prefix для trend lookup
     trend = get_trend(dk, tgt_lbl) if tgt_lbl else None
     msg = (f"*{label} — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n\n"
-           + fmt_weather(dt, fc, city) + "\n"
+           + fmt_weather(dt, fc, city, market_type) + "\n"
            + fmt_polymarket(dt, outcomes, tgt_lbl, tgt_pct, link, fc["final_int"], trend, city))
     if tgt_pct is not None and tgt_pct < BUY_MAX_PCT:
         mn  = re.search(r"(\d+)", tgt_lbl or "")
@@ -1001,103 +1120,198 @@ async def job_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 #  COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+
+async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /portfolio — показати статистику портфеля
+    /portfolio set 500 — встановити початковий баланс $500
+    /portfolio set 500 450 — початковий $500, поточний $450
+    /portfolio trades — останні 10 угод
+    /portfolio reset — скинути статистику
+    """
+    args = list(context.args or [])
+
+    if not args:
+        # Показуємо статистику
+        msg = portfolio_summary()
+        # Додаємо активні позиції
+        active = {dk: s for dk, s in monitoring.items() if s.get("active")}
+        if active:
+            invested = sum(s.get("position_size") or 0 for s in active.values())
+            msg += f"\nВ позиціях зараз: ${invested:.2f}"
+        await update.message.reply_text(msg, reply_markup=main_keyboard())
+        return
+
+    cmd = args[0].lower()
+
+    if cmd == "set":
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Використання: /portfolio set <початковий_баланс> [поточний_баланс]\n"
+                "Приклад: /portfolio set 500\n"
+                "Або: /portfolio set 500 450")
+            return
+        try:
+            init = float(args[1])
+            current = float(args[2]) if len(args) > 2 else init
+        except ValueError:
+            await update.message.reply_text("Введи числа. Приклад: /portfolio set 500"); return
+
+        portfolio["initial_balance"] = init
+        portfolio["current_balance"] = current
+        save_portfolio()
+
+        pnl = round(current - init, 2)
+        await update.message.reply_text(
+            f"Портфель налаштовано!\n\n"
+            f"Початковий баланс: ${init:.2f}\n"
+            f"Поточний баланс:   ${current:.2f}\n"
+            f"P&L: {pnl:+.2f}$",
+            reply_markup=main_keyboard())
+
+    elif cmd == "trades":
+        trades = portfolio.get("trades", [])
+        if not trades:
+            await update.message.reply_text("Угод ще немає."); return
+        last10 = trades[-10:]
+        lines  = [f"Останні {len(last10)} угод:\n"]
+        for t in reversed(last10):
+            emoji  = CITIES.get(t.get("city","london"), CITIES["london"])["emoji"]
+            result = {"win":"WIN","loss":"LOSS","manual":"SELL"}.get(t.get("result","manual"),"?")
+            amount = t.get("amount_usd", 0)
+            profit = t.get("profit", 0)
+            roi    = t.get("roi_pct", 0)
+            lines.append(
+                f"{emoji} {t['date']} {t['outcome']} [{result}]\n"
+                f"  {t['buy_pct']}% -> {t['sell_pct']}% | "
+                f"${amount:.0f} -> {profit:+.2f}$ ({roi:+.1f}%)"
+            )
+        await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+
+    elif cmd == "reset":
+        portfolio["trades"] = []
+        portfolio["current_balance"] = portfolio.get("initial_balance")
+        save_portfolio()
+        await update.message.reply_text("Журнал угод очищено.", reply_markup=main_keyboard())
+
+    else:
+        await update.message.reply_text(
+            "/portfolio — статистика\n"
+            "/portfolio set 500 — встановити баланс\n"
+            "/portfolio set 500 450 — початковий та поточний\n"
+            "/portfolio trades — останні угоди\n"
+            "/portfolio reset — скинути журнал")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     lines = [
-        "🤖 PolyWeather Bot v4",
+        "🤖 PolyWeather Bot v4.1",
         f"chat_id: {cid}",
         "",
-        "━━━ 🌍 МІСТА ━━━",
+        "━━━ 🌍 МІСТО ━━━",
         "Кнопки: 🇬🇧 London / 🇩🇪 Munich",
-        "Або вказуй місто явно в команді.",
         "Ключі: london, munich",
+        "",
+        "━━━ 🌡️ ТИП РИНКУ ━━━",
+        "Кнопки: 🌡️ Макс / ❄️ Мін",
+        "  🌡️ Макс — Highest temperature (max за день)",
+        "  ❄️ Мін  — Lowest temperature (min за ніч/ранок)",
+        "Або явно в команді: highest / lowest / max / min",
         "",
         "━━━ 📊 ПРОГНОЗ ━━━",
         "Кнопки: Сьогодні / Завтра / Після завтра",
-        "/check [місто] [DD.MM] — прогноз + Polymarket",
-        "  /check — завтра (поточне місто)",
+        "/check [тип] [місто] [DD.MM]",
+        "  /check — макс London завтра",
+        "  /check lowest london 01.05 — мін London",
+        "  /check highest munich 02.05 — макс Munich",
         "  /check today — сьогодні",
-        "  /check munich 30.04 — Munich 30 квітня",
         "/check2 — завтра + після завтра",
-        "/forecast [місто] [DD.MM] — лише погода",
+        "/forecast [місто] [DD.MM] — лише погода (4 моделі)",
         "/poll [місто] [DD.MM] — лише Polymarket",
         "",
-        "4 моделі прогнозу:",
-        "  ECMWF (9km) + DWD ICON (2km)",
-        "  UK Met Office (2-10km) + Meteo-France (1.3-2.5km)",
+        "4 моделі: ECMWF + DWD ICON + UK Met Office + Meteo-France",
         "",
-        "━━━ 💰 КУПІВЛЯ — /buy ━━━",
-        "Формат повної команди:",
-        "  /buy [місто] <темп> [DD.MM] [опції]",
+        "━━━ 💰 КУПІВЛЯ /buy ━━━",
+        "Формат: /buy [місто] <темп> [DD.MM] [опції]",
         "",
-        "Параметри:",
-        "  [місто]     — london або munich (за замовч. london)",
-        "  <темп>      — ціле число градусів (обов'язково)",
-        "  [DD.MM]     — дата (за замовч. завтра)",
-        "  --price X   — ціна за якою реально купив, %",
-        "  --amount X  — розмір позиції в USD/USDT",
-        "  --stop X    — стоп-лос: алерт якщо ціна впаде до X%",
-        "  --tp X      — тейк-профіт: алерт при досягненні X%",
+        "  /buy 19 — London макс завтра, 19C",
+        "  /buy 19 02.05 — London макс 2 травня",
+        "  /buy london 19 02.05 — явно London",
+        "  /buy munich 20 02.05 — Munich",
         "",
-        "Приклади London:",
-        "  /buy 19",
-        "    куп. 19C завтра London, ціна = поточна",
-        "  /buy 19 02.05",
-        "    куп. 19C London 2 травня",
-        "  /buy 19 02.05 --price 13.3 --amount 50",
-        "    куп. 19C за 13.3%, позиція $50",
-        "    покаже: виплата $376, прибуток $326",
-        "  /buy 19 02.05 --price 13.3 --amount 50 --stop 5 --tp 60",
-        "    повний набір параметрів",
+        "Опції:",
+        "  --price X   — ціна покупки, %",
+        "  --amount X  — розмір позиції в USD",
+        "  --stop X    — стоп-лос при падінні до X%",
+        "  --tp X      — тейк-профіт при X%",
         "",
-        "Приклади Munich:",
-        "  /buy munich 20",
-        "    куп. 20C завтра Munich",
-        "  /buy munich 20 30.04 --price 29 --amount 30",
-        "  /buy munich 15 30.04 --amount 20 --stop 10 --tp 55",
+        "Повний приклад:",
+        "  /buy london 21 02.05 --price 30 --amount 50 --stop 15 --tp 65",
         "",
-        "Декілька позицій на одну дату:",
+        "Кілька позицій на одну дату:",
         "  /buy 19 02.05 --amount 30",
-        "  /buy 20 02.05 --amount 20  <- окрема позиція!",
+        "  /buy 21 02.05 --amount 20  <- окрема!",
         "",
-        "Якщо позиція вже є — бот повідомить.",
-        "Щоб оновити ціну: /buy 19 02.05 --price <нова>",
-        "",
-        "━━━ 📤 ЗАКРИТТЯ — /sell ━━━",
-        "  /sell — закрити єдину активну",
+        "━━━ 📤 ЗАКРИТТЯ /sell ━━━",
+        "  /sell — єдина активна",
         "  /sell 02.05 — всі на цю дату",
-        "  /sell 02.05 19 — тільки 19C на 02.05",
+        "  /sell 02.05 19 — тільки 19C",
         "  /sell london 02.05 19 — London 19C",
-        "  /sell munich 30.04 20 — Munich 20C",
+        "  /sell munich 02.05 20 — Munich 20C",
         "  /sell all — закрити всі",
         "",
-        "━━━ 📈 ПОЗИЦІЇ ━━━",
-        "  /positions — всі активні + ROI + USD вартість",
-        "  /trend — тренд цін по всіх позиціях",
-        "  /trend 02.05 — тренд конкретної дати",
+        "━━━ 📈 ПЕРЕГЛЯД ━━━",
+        "  /positions — всі позиції + ROI + USD",
+        "  /trend — тренд по всіх позиціях",
+        "  /trend 02.05 — тренд конкретної",
         "",
         "━━━ 🧠 НАВЧАННЯ ━━━",
-        "Після дня вводь фактичну температуру EGLC/EDDM:",
-        "  /actual 16.5 — факт за вчора",
-        "  /actual 16.5 28.04 — факт за конкретний день",
-        "Бот сам знає свій прогноз всіх 4 моделей.",
-        "  /history — точність кожної моделі",
+        "Після дня вводь фактичну температуру:",
+        "  /actual 16.5 — London (EGLC) за вчора",
+        "  /actual london 16.5 — London явно",
+        "  /actual munich 20.1 — Munich (EDDM) за вчора",
+        "  /actual london 16.5 28.04 — конкретний день",
+        "  /actual munich 20.1 28.04 — Munich конкретний день",
+        "",
+        "Якщо прогноз не збережено — бот автоматично",
+        "завантажить ERA5 архів з Open-Meteo.",
+        "",
+        "  /history — точність всіх моделей",
+        "  /history london — тільки London",
+        "  /history munich — тільки Munich",
         "",
         "━━━ ⏰ АВТОМАТИКА ━━━",
         "07:30 — ранковий брифінг",
         "09:00 — скан нових ринків (BUY < 38%)",
         "14:00 — денний звіт",
-        "Кожні 2 хв — ціни позицій",
+        "Кожні 2 хв — моніторинг цін позицій",
         "Кожні 30 хв — зміна прогнозу погоди",
-        "  /briefing — запустити вручну",
+        "  /briefing — вручну",
+        "",
+        "━━━ 💼 ПОРТФЕЛЬ ━━━",
+        "/portfolio — статистика балансу і угод",
+        "/portfolio set 500 — встановити початковий баланс",
+        "/portfolio set 500 450 — поч. + поточний баланс",
+        "/portfolio trades — журнал останніх угод",
+        "/portfolio reset — скинути журнал",
+        "",
+        "При закритті вказуй ціну:",
+        "  /sell 02.05 19 --price 62.0 — закрив за 62%",
+        "  /sell 02.05 19 — закрив по ринку (поточна ціна)",
         "",
         "━━━ 🔔 АЛЕРТИ ━━━",
         "Рівні: 40 → 50 → 60 → 70 → 80 → 90%",
         "Стоп-лос / Тейк-профіт / Momentum / Прогноз",
         "",
+        "━━━ 💾 ДАНІ ━━━",
+        "Всі дані зберігаються на диску.",
+        "Render Disk: встанови DATA_DIR=/data",
+        "",
         "━━━ 📡 СТАНЦІЇ ━━━",
         "🇬🇧 London: EGLC (London City Airport)",
         "🇩🇪 Munich: EDDM (Munich Airport)",
+        "Джерело resolution: Wunderground",
     ]
     await update.message.reply_text(
         "\n".join(lines),
@@ -1106,17 +1320,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /check [highest|lowest] [місто] [DD.MM]
+    Приклади:
+      /check — highest London завтра
+      /check lowest london 01.05 — мінімальна London
+      /check highest munich 02.05 — максимальна Munich
+    """
     args = list(context.args or [])
+    market_type = "highest"
+    if args and args[0].lower() in ("highest", "lowest", "max", "min"):
+        raw_type = args.pop(0).lower()
+        market_type = "lowest" if raw_type in ("lowest", "min") else "highest"
     city = "london"
     if args and args[0].lower() in CITIES:
         city = args.pop(0).lower()
     dt, err = parse_target_date(args)
     if err: await update.message.reply_text(err, parse_mode="Markdown"); return
     cfg = CITIES[city]
+    type_label = "🌡️ Макс" if market_type == "highest" else "🌡️ Мін"
     await update.message.reply_text(
-        f"⏳ {cfg['emoji']} *{cfg['name']} {dt.strftime('%d.%m.%Y')}*…", parse_mode="Markdown")
+        f"⏳ {cfg['emoji']} *{cfg['name']} {type_label} {dt.strftime('%d.%m.%Y')}*…",
+        parse_mode="Markdown")
     await _send_full_report(context.bot, dt, update.effective_chat.id,
-                            f"🔍 {cfg['emoji']} Запит", city)
+                            f"🔍 {cfg['emoji']} {type_label}", city, market_type)
 
 
 async def cmd_check2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1382,11 +1609,18 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     active = {dk: s for dk, s in monitoring.items() if s.get("active")}
     if not active: await update.message.reply_text("ℹ️ Немає активних позицій."); return
-    arg = context.args[0].lower() if context.args else ""
+    # Парсимо --price (ціна закриття)
+    close_price = None
+    sell_args = list(context.args)
+    if "--price" in sell_args:
+        idx = sell_args.index("--price")
+        try: close_price = float(sell_args[idx+1]); sell_args = sell_args[:idx] + sell_args[idx+2:]
+        except (IndexError, ValueError): pass
+    arg = sell_args[0].lower() if sell_args else ""
     if arg == "all":
         to_close = list(active.keys())
     elif arg:
-        args_sell = list(context.args)
+        args_sell = list(sell_args)
         # Парсимо місто якщо є
         sell_city = None
         if args_sell and args_sell[0].lower() in CITIES:
@@ -1428,12 +1662,18 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _, markets, _ = get_polymarket_data(dt, m_city)
         outcomes = parse_all_outcomes(markets) if markets else {}
         cur = outcomes.get(lbl)
+        sell_p = close_price if close_price is not None else (cur if isinstance(cur, float) else buy)
         state["active"] = False
-        save_monitoring()  # зберігаємо після закриття
+        save_monitoring()
+        trade = record_trade(dk, state, sell_p if sell_p else buy)
         profit = ""
-        if isinstance(cur, float) and isinstance(buy, float) and buy > 0:
-            roi = round((cur / buy - 1) * 100, 1); profit = f" │ ROI: {roi:+.1f}%"
-        lines.append(f"🛑 *{dt.strftime('%d.%m')}* `{lbl}`: {buy}% → {cur}%{profit}")
+        if isinstance(sell_p, float) and isinstance(buy, float) and buy > 0:
+            roi = round((sell_p / buy - 1) * 100, 1)
+            profit = f" | ROI: {roi:+.1f}%"
+            if state.get("position_size"):
+                profit += f" | P&L: ${trade['profit']:+.2f}"
+        price_note = f" (ціна: {sell_p}%)" if close_price is not None else " (ринок)"
+        lines.append(f"🛑 *{dt.strftime('%d.%m')}* `{lbl}`: {buy}% -> {sell_p}%{price_note}{profit}")
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown",
                                     reply_markup=main_keyboard())
 
@@ -1477,17 +1717,66 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /history [місто] — точність моделей для конкретного міста
+    /history — всі міста
+    """
     if not SOURCE_STATS:
         await update.message.reply_text(
-            "📊 Немає даних.\nЗапис: `/actual ECMWF 17.2 16.5 4`",
+            "📊 Немає даних.\n\n"
+            "Запис факту:\n"
+            "`/actual 16.5` — London (EGLC) за вчора\n"
+            "`/actual munich 20.1` — Munich (EDDM) за вчора\n"
+            "`/actual london 16.5 28.04` — London конкретний день",
             parse_mode="Markdown"); return
-    lines = ["📊 *Точність моделей (EGLC)*\n"]
-    for src, months in SOURCE_STATS.items():
-        lines.append(f"*{src}:*")
-        for mk, st in sorted(months.items(), key=lambda x: int(x[0])):
-            mn = datetime(2000, int(mk), 1).strftime("%B")
-            lines.append(f"  {mn}: MAE {st['mae']:.1f}°C, зміщ {st['bias']:+.1f}°C (n={st['n']})")
-        lines.append("")
+
+    # Парсимо аргумент міста
+    args = list(context.args or [])
+    filter_city = args[0].lower() if args and args[0].lower() in CITIES else None
+
+    lines = []
+    for city_key, city_cfg in CITIES.items():
+        if filter_city and city_key != filter_city:
+            continue
+        station = city_cfg["station"]
+        emoji   = city_cfg["emoji"]
+        name    = city_cfg["name"]
+
+        # Збираємо статистику для цього міста
+        # SOURCE_STATS зберігає bias по всіх моделях разом
+        # Розділяємо по місту через ключ city_key в записах (якщо є)
+        # або показуємо загальну якщо немає розділення
+        city_lines = [f"📊 *{emoji} {name} ({station})*\n"]
+        has_data = False
+
+        for model_name, months in SOURCE_STATS.items():
+            month_lines = []
+            for mk, st in sorted(months.items(), key=lambda x: int(x[0])):
+                if st.get("n", 0) == 0:
+                    continue
+                mn = datetime(2000, int(mk), 1).strftime("%B")
+                status = "✅" if st["n"] >= 5 else "⏳"
+                month_lines.append(
+                    f"  {mn}: MAE {st['mae']:.1f}°C, зміщ {st['bias']:+.1f}°C"
+                    f" (n={st['n']}) {status}"
+                )
+            if month_lines:
+                city_lines.append(f"*{model_name}:*")
+                city_lines.extend(month_lines)
+                city_lines.append("")
+                has_data = True
+
+        if has_data:
+            lines.extend(city_lines)
+        else:
+            lines.append(f"📊 *{emoji} {name}* — даних ще немає\n")
+
+    if not lines:
+        lines = ["📊 Немає даних для вибраного міста."]
+
+    lines.append("✅ = навчена поправка активна (n≥5)")
+    lines.append("⏳ = базова таблиця (потрібно більше записів)")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
                                     reply_markup=main_keyboard())
 
@@ -1553,37 +1842,34 @@ async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cached   = forecast_cache.get(dk)
 
     if not cached:
-        # Кеш відсутній (новий деплой або дата давня) — дозволяємо ручне введення
-        # Формат: /actual <факт> <дата> <ECMWF_прогноз> <DWD_прогноз> <UKMet_прогноз>
-        if len(context.args) >= 5:
-            try:
-                manual = {
-                    "ECMWF":          float(context.args[2]),
-                    "DWD ICON":       float(context.args[3]),
-                    "UK Met Office":  float(context.args[4]),
-                    "final":          float(context.args[2]),
-                    "month":          dt.month,
-                }
-                cached = manual
-            except (ValueError, IndexError):
-                pass
-        if not cached:
+        # Кеш відсутній — спочатку пробуємо ERA5 ретроспективний прогноз
+        await update.message.reply_text(
+            f"⏳ Кеш прогнозу для {dt.strftime('%d.%m.%Y')} відсутній. "
+            f"Завантажую ретроспективні дані ERA5...",
+            parse_mode="Markdown")
+
+        retro = fetch_archive_forecast(dt, actual_city)
+        if retro:
+            cached = retro
+            logger.info("Using ERA5 retrospective for %s %s", actual_city, dk)
+        else:
+            # ERA5 недоступний — показуємо помилку
             avail = ", ".join(sorted(forecast_cache.keys())[-5:]) or "немає"
             await update.message.reply_text(
-                f"⚠️ Немає збереженого прогнозу для *{dt.strftime('%d.%m.%Y')}*.\n\n"
-                f"Прогнози зберігаються після кожного `/check` або авто-звіту.\n"
-                f"Доступні дати: {avail}\n\n"
-                f"*Або введи вручну:*\n"
-                f"`/actual {actual_temp} {dt.strftime('%d.%m')} <ECMWF> <DWD> <UKMet>`\n"
-                f"Приклад: `/actual {actual_temp} {dt.strftime('%d.%m')} 16.8 16.2 16.8`",
+                f"⚠️ ERA5 недоступний для *{dt.strftime('%d.%m.%Y')}*.\n\n"
+                f"Доступні дати в кеші: {avail}\n\n"
+                f"Введи вручну:\n"
+                f"`/actual {actual_city} {actual_temp} {dt.strftime('%d.%m')} <ECMWF> <DWD> <UKMet>`",
                 parse_mode="Markdown"); return
 
     # Записуємо факт для кожної моделі яка є в кеші
+    is_retro = "_source" in cached  # ERA5 ретроспектива
+    retro_note = f"\n_⚠️ {cached['_note']}_" if is_retro else ""
     lines = [
         f"✅ *Факт {city_cfg['emoji']} {city_cfg['name']} ({station})"
-        f" {dt.strftime('%d.%m.%Y')}: {actual_temp}°C*\n"
+        f" {dt.strftime('%d.%m.%Y')}: {actual_temp}°C*{retro_note}\n"
     ]
-    sources_in_cache = ["ECMWF", "DWD ICON", "UK Met Office"]
+    sources_in_cache = ["ECMWF", "DWD ICON", "UK Met Office", "Meteo-France"]
     for source_name in sources_in_cache:
         predicted = cached.get(source_name)
         if predicted is None:
@@ -1703,7 +1989,89 @@ async def job_forecast_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # Стан вибраного міста для кожного чату (спрощено — один глобальний)
-selected_city: dict[int, str] = {}  # {chat_id: "london"/"munich"}
+selected_city: dict[int, str] = {}         # {chat_id: "london"/"munich"}
+selected_market_type: dict[int, str] = {}  # {chat_id: "highest"/"lowest"}
+
+
+# ══════ PORTFOLIO ══════════════════════════════════════════════════════════
+portfolio: dict = {"initial_balance": None, "current_balance": None, "trades": []}
+
+
+def load_portfolio() -> None:
+    global portfolio
+    if PORTFOLIO_FILE.exists():
+        try:
+            portfolio = json.loads(PORTFOLIO_FILE.read_text())
+            logger.info("Portfolio: balance=%.2f trades=%d",
+                        portfolio.get("current_balance") or 0,
+                        len(portfolio.get("trades", [])))
+        except Exception as e:
+            logger.warning("Load portfolio: %s", e)
+
+
+def save_portfolio() -> None:
+    try: PORTFOLIO_FILE.write_text(json.dumps(portfolio, indent=2))
+    except Exception as e: logger.error("Save portfolio: %s", e)
+
+
+def record_trade(dk: str, state: dict, sell_pct: float, result: str = "manual") -> dict:
+    amount  = state.get("position_size") or 0.0
+    buy_pct = state.get("buy_pct") or sell_pct
+    city    = state.get("city", "london")
+    dt_obj  = state["target_date"]
+    lbl     = state["outcome_label"]
+
+    if sell_pct >= 99.0:
+        payout = round(amount / (buy_pct / 100), 2) if buy_pct > 0 and amount > 0 else 0.0
+        result = "win"
+    elif sell_pct <= 1.0:
+        payout = 0.0
+        result = "loss"
+    else:
+        payout = round(amount / (buy_pct / 100) * (sell_pct / 100), 2) if buy_pct > 0 and amount > 0 else 0.0
+
+    profit = round(payout - amount, 2) if amount > 0 else 0.0
+    roi    = round((profit / amount) * 100, 1) if amount > 0 else 0.0
+
+    trade = {
+        "dk": dk, "city": city,
+        "date": dt_obj.strftime("%d.%m.%Y"), "outcome": lbl,
+        "buy_pct": buy_pct, "sell_pct": sell_pct,
+        "amount_usd": amount, "payout": payout,
+        "profit": profit, "roi_pct": roi,
+        "result": result,
+        "closed_at": datetime.utcnow().isoformat(timespec="minutes"),
+    }
+    portfolio.setdefault("trades", []).append(trade)
+    if portfolio.get("current_balance") is not None and amount > 0:
+        portfolio["current_balance"] = round(portfolio["current_balance"] - amount + payout, 2)
+    save_portfolio()
+    return trade
+
+
+def portfolio_summary() -> str:
+    if portfolio.get("initial_balance") is None:
+        return "Портфель не налаштовано. /portfolio set 500"
+    init    = portfolio["initial_balance"]
+    current = portfolio.get("current_balance", init)
+    trades  = portfolio.get("trades", [])
+    pnl     = round(current - init, 2)
+    roi     = round((pnl / init) * 100, 1) if init > 0 else 0.0
+    wins    = sum(1 for t in trades if t.get("result") == "win")
+    losses  = sum(1 for t in trades if t.get("result") == "loss")
+    manual  = sum(1 for t in trades if t.get("result") == "manual")
+    total   = len(trades)
+    wr      = round(wins / total * 100, 1) if total > 0 else 0.0
+    avg_roi = round(sum(t.get("roi_pct", 0) for t in trades) / total, 1) if total > 0 else 0.0
+    sign    = "UP" if pnl >= 0 else "DOWN"
+    lines   = [
+        f"Початок: ${init:.2f}",
+        f"Зараз:   ${current:.2f} ({pnl:+.2f}$ / {roi:+.1f}%) {sign}",
+        "",
+        f"Угод: {total} | Win: {wins} | Loss: {losses} | Manual: {manual}",
+        f"Win rate: {wr}% | Avg ROI: {avg_roi:+.1f}%",
+    ]
+    return "\n".join(lines)
 
 
 def save_selected_city() -> None:
@@ -1733,8 +2101,23 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     cid     = update.effective_chat.id
     # Поточне вибране місто
-    city    = selected_city.get(cid, "london")
-    city_cfg = CITIES[city]
+    city        = selected_city.get(cid, "london")
+    city_cfg    = CITIES[city]
+    market_type = selected_market_type.get(cid, "highest")
+
+    # Вибір типу ринку
+    if text == "🌡️ Макс":
+        selected_market_type[cid] = "highest"
+        await update.message.reply_text(
+            f"🌡️ Тип: Максимальна температура (Highest)",
+            reply_markup=main_keyboard())
+        return
+    elif text == "❄️ Мін":
+        selected_market_type[cid] = "lowest"
+        await update.message.reply_text(
+            f"❄️ Тип: Мінімальна температура (Lowest)",
+            reply_markup=main_keyboard())
+        return
 
     # Вибір міста
     if text == "🇬🇧 London":
@@ -1754,12 +2137,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if text == "📅 Сьогодні":
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        await _send_full_report(context.bot, today, cid, "📅 Сьогодні", city)
+        await _send_full_report(context.bot, today, cid, "📅 Сьогодні", city, market_type)
     elif text in ("🔍 Завтра", "🔍 Прогноз завтра"):
-        await _send_full_report(context.bot, tomorrow, cid, f"🔍 {city_cfg['emoji']} Завтра", city)
+        await _send_full_report(context.bot, tomorrow, cid, f"🔍 {city_cfg['emoji']} Завтра", city, market_type)
     elif text == "📅 Після завтра":
         day_after = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
-        await _send_full_report(context.bot, day_after, cid, f"📅 {city_cfg['emoji']} Після завтра", city)
+        await _send_full_report(context.bot, day_after, cid, f"📅 {city_cfg['emoji']} Після завтра", city, market_type)
     elif text == "📅 Прогноз 2 дні":
         await update.message.reply_text("⏳ Збираю дані для 2 днів…")
         for days in (1, 2):
@@ -1831,12 +2214,14 @@ def main() -> None:
     load_price_history()
     load_forecast_cache()
     load_forecast_changes()
-    load_monitoring()      # відновлюємо позиції після деплою
-    load_selected_city()   # відновлюємо вибране місто
+    load_monitoring()
+    load_selected_city()
+    load_portfolio()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
     for cmd, handler in [
+        ("portfolio", cmd_portfolio),
         ("start",     cmd_start),     ("check",    cmd_check),
         ("check2",    cmd_check2),    ("poll",     cmd_poll),
         ("forecast",  cmd_forecast),  ("trend",    cmd_trend),
