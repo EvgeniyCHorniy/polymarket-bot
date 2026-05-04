@@ -1864,7 +1864,7 @@ async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Записуємо факт для кожної моделі яка є в кеші
     is_retro = "_source" in cached  # ERA5 ретроспектива
-    retro_note = f"\n_⚠️ {cached['_note']}_" if is_retro else ""
+    retro_note = f"\n_⚠️ {cached.get('_note', cached.get('_source', ''))}_" if is_retro else ""
     lines = [
         f"✅ *Факт {city_cfg['emoji']} {city_cfg['name']} ({station})"
         f" {dt.strftime('%d.%m.%Y')}: {actual_temp}°C*{retro_note}\n"
