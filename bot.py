@@ -108,6 +108,15 @@ CITIES = {
         "station": "EDDM", "slug_city": "munich",
         "tz": "Europe/Berlin",
     },
+    "warsaw": {
+        "name":      "Warsaw",
+        "emoji":     "🇵🇱",
+        "lat":       52.1657,
+        "lon":       20.9671,
+        "station":   "EPWA",
+        "slug_city": "warsaw",
+        "tz":        "Europe/Warsaw",
+    },
 }
 
 OUTLIER_THRESHOLD  = 2.0
@@ -429,6 +438,169 @@ def fetch_meteofrance(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON
     return _build_source("Meteo-France", data, ds, market_type) if data else None
 
 
+
+
+def fetch_ensemble(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON,
+                   tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
+    """
+    Тягне GFS Ensemble (31 члени) + ECMWF ENS (51 членів) через Open-Meteo Ensemble API.
+    Повертає повний розподіл ймовірностей температури.
+
+    Endpoint: https://api.open-meteo.com/v1/ensemble
+    Models: gfs_seamless (31 members), ecmwf_ifs025 (51 members)
+    """
+    ds = dt.strftime("%Y-%m-%d")
+
+    results = {}
+    # GFS Ensemble — 31 членів, найкращий для 1-7 днів
+    for model_name, model_param, n_members in [
+        ("GFS ENS",   "gfs_seamless",   31),
+        ("ECMWF ENS", "ecmwf_ifs025",   51),
+    ]:
+        data = _safe_get("https://api.open-meteo.com/v1/ensemble", params={
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m",
+            "models": model_param,
+            "timezone": tz,
+            "start_date": ds, "end_date": ds,
+        })
+        if not data:
+            continue
+
+        hourly = data.get("hourly", {})
+        times  = hourly.get("time", [])
+
+        # Збираємо всі member values для максимальної/мінімальної температури
+        member_temps = []
+        # Ключі членів: temperature_2m_member01, temperature_2m_member02, ...
+        member_keys = [k for k in hourly.keys() if k.startswith("temperature_2m_member")]
+
+        # Якщо немає member ключів — беремо temperature_2m (mean)
+        if not member_keys:
+            member_keys = ["temperature_2m"]
+
+        for mk in member_keys:
+            day_temps = []
+            vals = hourly.get(mk, [])
+            for i, t in enumerate(times):
+                if t.startswith(ds) and i < len(vals) and vals[i] is not None:
+                    day_temps.append(float(vals[i]))
+            if day_temps:
+                val = min(day_temps) if market_type == "lowest" else max(day_temps)
+                member_temps.append(val)
+
+        if len(member_temps) < 2:
+            continue
+
+        results[model_name] = {
+            "members": member_temps,
+            "n":       len(member_temps),
+            "mean":    round(sum(member_temps) / len(member_temps), 2),
+            "std":     round((sum((x - sum(member_temps)/len(member_temps))**2
+                              for x in member_temps) / len(member_temps)) ** 0.5, 2),
+            "min":     round(min(member_temps), 1),
+            "max":     round(max(member_temps), 1),
+        }
+
+    return results if results else None
+
+
+def ensemble_probability(ensemble_result: dict | None, target_temp: int,
+                         bias: float = 0.0) -> dict:
+    """
+    1.2 Bayesian Normal CDF probability:
+    Рахує ймовірність кожного температурного бакету на основі ensemble розподілу.
+    Використовує Normal CDF навколо ensemble mean зі spread як std.
+
+    1.3 Brier Score compatible output:
+    Повертає calibrated probability для кожного outcome.
+    """
+    import math
+
+    def normal_cdf(x: float, mu: float, sigma: float) -> float:
+        """Standard Normal CDF через наближення."""
+        if sigma <= 0:
+            return 1.0 if x >= mu else 0.0
+        z = (x - mu) / sigma
+        # Abramowitz & Stegun approximation — точність ~1.5e-7
+        t = 1.0 / (1.0 + 0.2316419 * abs(z))
+        poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 +
+               t * (-1.821255978 + t * 1.330274429))))
+        cdf = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * z * z) * poly
+        return cdf if z >= 0 else 1.0 - cdf
+
+    def bucket_prob(low: float, high: float, mu: float, sigma: float) -> float:
+        """P(low <= X < high) для Normal(mu, sigma)."""
+        return max(0.0, normal_cdf(high, mu, sigma) - normal_cdf(low, mu, sigma))
+
+    if not ensemble_result:
+        return {}
+
+    # Агрегуємо всі member temps з усіх моделей (зважено: ECMWF ENS вага 0.55, GFS ENS 0.45)
+    model_weights = {"ECMWF ENS": 0.55, "GFS ENS": 0.45}
+    all_temps   = []
+    total_w     = 0.0
+    weighted_mu = 0.0
+
+    for model_name, res in ensemble_result.items():
+        w = model_weights.get(model_name, 0.5)
+        weighted_mu += res["mean"] * w
+        total_w     += w
+        all_temps.extend(res["members"])
+
+    if total_w == 0 or not all_temps:
+        return {}
+
+    mu_raw = weighted_mu / total_w
+    mu     = round(mu_raw + bias, 2)  # застосовуємо EGLC/EDDM bias
+
+    # Std — зважена по моделях
+    weighted_var = 0.0
+    tw = 0.0
+    for model_name, res in ensemble_result.items():
+        w = model_weights.get(model_name, 0.5)
+        weighted_var += (res["std"] ** 2 + (res["mean"] - mu_raw) ** 2) * w
+        tw += w
+    sigma = round((weighted_var / tw) ** 0.5, 2) if tw > 0 else 1.0
+
+    # Будуємо ймовірності для температурних бакетів ±5°C навколо mu
+    center = round(mu)
+    probs  = {}
+    for t in range(center - 4, center + 5):
+        p = bucket_prob(t - 0.5, t + 0.5, mu, sigma)
+        if p > 0.001:
+            probs[t] = round(p * 100, 1)  # у відсотках
+
+    return {
+        "mu":     mu,
+        "mu_raw": round(mu_raw, 2),
+        "sigma":  sigma,
+        "probs":  probs,   # {17: 28.3, 18: 35.1, ...}
+        "models": {k: {"mean": v["mean"], "std": v["std"], "n": v["n"]}
+                   for k, v in ensemble_result.items()},
+    }
+
+
+def brier_score_update(source: str, city: str, month: int,
+                       predicted_prob: float, actual_outcome: bool) -> float:
+    """
+    1.3 Brier Score: BS = (p - o)^2
+    p = predicted probability (0..1)
+    o = actual outcome (1 якщо правильно, 0 якщо ні)
+    Менше = краще. 0 = ідеально, 0.25 = random.
+    Зберігає в SOURCE_STATS для калібрування.
+    """
+    o  = 1.0 if actual_outcome else 0.0
+    bs = (predicted_prob - o) ** 2
+    key_bs = f"{source}_brier_{city}"
+    SOURCE_STATS.setdefault(key_bs, {}).setdefault(str(month), {"bs_sum": 0.0, "n": 0})
+    s = SOURCE_STATS[key_bs][str(month)]
+    s["bs_sum"] += bs
+    s["n"]      += 1
+    s["avg_bs"]  = round(s["bs_sum"] / s["n"], 4)
+    save_history()
+    return bs
+
 def get_all_sources(dt: datetime, city: str = "london", market_type: str = "highest") -> list[dict]:
     """
     Збирає 4 незалежні моделі:
@@ -541,33 +713,108 @@ def detect_outliers(sources: list[dict]) -> list[dict]:
 
 
 def compute_forecast(dt: datetime, city: str = "london", market_type: str = "highest") -> dict:
-    raw = get_all_sources(dt, city, market_type)
-    if not raw: return {"error": f"Не вдалось отримати дані жодного джерела для {city}"}
-    raw = detect_outliers(raw)
+    """
+    Повний ансамблевий прогноз з 5 покращеннями:
+    1.1 GFS ENS 31 + ECMWF ENS 51 членів
+    1.2 Bayesian Normal CDF probability distribution
+    1.3 Brier Score compatible output
+    1.4 METAR реального часу (якщо день резолюції)
+    1.5 Кліматологія ERA5 за 5 років як prior
+    """
+    cfg   = CITIES.get(city, CITIES["london"])
     month = dt.month
+    today = datetime.utcnow().date()
+    bias  = get_learned_bias("ECMWF", month)  # загальний bias для міста
+
+    # ── Базові 4 моделі (детерміністичні) ──
+    raw = get_all_sources(dt, city, market_type)
+    if not raw:
+        return {"error": f"Не вдалось отримати дані жодного джерела для {city}"}
+    raw = detect_outliers(raw)
     enriched = []
     for s in raw:
-        bias      = get_learned_bias(s["source"], month)
-        corrected = round(s["wx_corrected"] + bias, 1)
-        enriched.append({**s, "bias": bias, "corrected": corrected,
+        src_bias  = get_learned_bias(s["source"], month)
+        corrected = round(s["wx_corrected"] + src_bias, 1)
+        enriched.append({**s, "bias": src_bias, "corrected": corrected,
                          "accuracy": source_accuracy_str(s["source"], month)})
+
     w_sum, w_tot = 0.0, 0.0
     for s in enriched:
         w = 0.05 if s.get("outlier") else SOURCE_WEIGHTS.get(s["source"], 0.30)
         w_sum += s["corrected"] * w; w_tot += w
-    weighted = round(w_sum / w_tot, 1) if w_tot else 0.0
-    vals     = sorted(s["corrected"] for s in enriched)
-    median   = _median(vals)
-    final    = round((weighted + median) / 2, 1)
-    spread   = max(vals) - min(vals) if vals else 0
-    n_out    = sum(1 for s in enriched if s.get("outlier"))
-    if n_out:          confidence = "⚠️ низька (аутлаєр)"
-    elif spread <= 0.5: confidence = "🟢 висока"
-    elif spread <= 1.5: confidence = "🟡 середня"
-    else:               confidence = "🟠 помірна"
-    return {"sources": enriched, "weighted_avg": weighted, "median": median,
-            "final_temp": final, "final_int": round(final), "month": month,
-            "max_spread": round(spread, 1), "confidence": confidence}
+    det_weighted = round(w_sum / w_tot, 1) if w_tot else 0.0
+    vals         = sorted(s["corrected"] for s in enriched)
+    det_median   = _median(vals)
+    det_spread   = max(vals) - min(vals) if vals else 0
+
+    # ── 1.1 Ensemble members (GFS 31 + ECMWF ENS 51) ──
+    ens_result = fetch_ensemble(dt, lat=cfg["lat"], lon=cfg["lon"],
+                                tz=cfg["tz"], market_type=market_type)
+
+    # ── 1.2 Bayesian Normal CDF probability distribution ──
+    ens_prob = ensemble_probability(ens_result, round(det_weighted), bias=bias)
+
+    # ── 1.5 Кліматологія ERA5 — тільки для горизонту 3+ днів ──
+    days_ahead = (dt.date() - today).days
+    climo = None
+    if days_ahead >= 3:
+        # Для далеких дат кліматологія дає корисний prior
+        climo = fetch_climatology(dt, city=city, market_type=market_type, years=5)
+
+    # ── Фінальний прогноз: зважена комбінація ──
+    if ens_prob and "mu" in ens_prob:
+        ens_mu = ens_prob["mu"]
+        if climo and days_ahead >= 3:
+            # 3+ дні: ENS 50% + NWP 30% + Climo 20%
+            final = round(
+                ens_mu             * 0.50 +
+                det_weighted       * 0.30 +
+                climo["climo_mean"] * 0.20, 1)
+        else:
+            # 1-2 дні: ENS 60% + NWP 40% (climo менш релевантна)
+            final = round(ens_mu * 0.60 + det_weighted * 0.40, 1)
+    else:
+        if climo and days_ahead >= 3:
+            final = round(det_weighted * 0.80 + climo["climo_mean"] * 0.20, 1)
+        else:
+            final = round((det_weighted + det_median) / 2, 1)
+
+    # ── 1.4 METAR — якщо день резолюції, додаємо реальний вимір ──
+    metar_data = None
+    if dt.date() == today:
+        metar_data = get_metar_for_city(city)
+        if metar_data:
+            # В день резолюції METAR має вагу 30%
+            final = round(final * 0.70 + metar_data["temp_c"] * 0.30, 1)
+            logger.info("METAR %s: %.1f°C → adjusted final: %.1f°C",
+                        cfg["station"], metar_data["temp_c"], final)
+
+    # ── Confidence ──
+    ens_std   = ens_prob.get("sigma", det_spread) if ens_prob else det_spread
+    n_out     = sum(1 for s in enriched if s.get("outlier"))
+    if n_out:             confidence = "⚠️ низька (аутлаєр)"
+    elif ens_std <= 0.5:  confidence = "🟢 висока"
+    elif ens_std <= 1.0:  confidence = "🟡 середня"
+    elif ens_std <= 1.5:  confidence = "🟠 помірна"
+    else:                 confidence = "🔴 низька"
+
+    return {
+        "sources":      enriched,
+        "weighted_avg": det_weighted,
+        "median":       det_median,
+        "final_temp":   final,
+        "final_int":    round(final),
+        "month":        month,
+        "max_spread":   round(det_spread, 1),
+        "confidence":   confidence,
+        # Нові поля:
+        "ensemble":     ens_result,    # 1.1 raw ensemble data
+        "ens_prob":     ens_prob,      # 1.2 probability distribution
+        "metar":        metar_data,    # 1.4 realtime METAR
+        "climo":        climo,         # 1.5 climatology prior
+        "ens_std":      round(ens_std, 2),
+        "days_ahead":   days_ahead,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -786,10 +1033,12 @@ def fmt_weather(dt: datetime, fc: dict, city: str = "london",
     name       = cfg["name"]
     type_label = "Макс" if market_type == "highest" else "Мін"
     temp_field = "temp_max" if market_type == "highest" else "temp_min"
+
     lines = [
         f"🌡 *{type_label} {emoji} {name} ({station}) — {dt.strftime('%d.%m.%Y')}{_days_label(dt)}*\n",
-        f"*4 моделі → погодинний {type_label.lower()} → {station} bias:*",
+        f"*4 NWP моделі → {station} bias:*",
     ]
+
     for s in fc["sources"]:
         out      = f" ⚠️ аутлаєр Δ{s['outlier_delta']}°C" if s.get("outlier") else ""
         bias_str = f"{s['bias']:+.1f}"
@@ -800,13 +1049,57 @@ def fmt_weather(dt: datetime, fc: dict, city: str = "london",
             f" → bias:{bias_str} → *{s['corrected']:.1f}°C*{out}"
         )
         lines.append(f"     _{s['accuracy']}_")
+
+    # ── Ensemble (GFS+ECMWF members) ──
+    ens = fc.get("ensemble") or {}
+    if ens:
+        ens_parts = []
+        for mname, mdata in ens.items():
+            ens_parts.append(
+                f"{mname}: {mdata['mean']:.1f}°C±{mdata['std']:.1f} (n={mdata['n']})"
+            )
+        lines.append(f"\n*Ensemble members:*")
+        for ep in ens_parts:
+            lines.append(f"  ▸ {ep}")
+
+    # ── Probability distribution (Bayesian Normal CDF) ──
+    ep = fc.get("ens_prob") or {}
+    if ep and ep.get("probs"):
+        probs = ep["probs"]
+        mu    = ep.get("mu", fc["final_temp"])
+        sigma = ep.get("sigma", fc.get("ens_std", 1.0))
+        # Топ-5 найімовірніших
+        top5  = sorted(probs.items(), key=lambda x: -x[1])[:5]
+        lines.append(f"\n*Ймовірнісний розподіл* (μ={mu:.1f}°C, σ={sigma:.1f}°C):")
+        for t_val, p_val in sorted(top5, key=lambda x: x[0]):
+            bar = "█" * int(p_val / 5) + "░" * (20 - int(p_val / 5))
+            lines.append(f"  {t_val}°C: {p_val:5.1f}% {bar[:10]}")
+
+    # ── METAR реального часу ──
+    metar = fc.get("metar")
+    if metar:
+        lines.append(
+            f"\n🛬 *METAR {station} зараз:* {metar['temp_c']:.1f}°C"
+            f"  _{metar.get('obs_time','')[:16]}_"
+        )
+
+    # ── Фінальний прогноз ──
     lines.append(
         f"\n📍 *{station} {type_label}:* {fc['final_temp']:.1f}°C → округлено *{fc['final_int']}°C*"
     )
-    lines.append(
-        f"   _(зваж: {fc['weighted_avg']:.1f} │ медіана: {fc['median']:.1f}"
-        f" │ розкид: {fc['max_spread']:.1f}°C)_"
-    )
+    det_info = (f"NWP зваж:{fc['weighted_avg']:.1f} │ "
+                f"ENS μ:{ep.get('mu', '—'):.1f}" if ep else
+                f"зваж:{fc['weighted_avg']:.1f} │ медіана:{fc['median']:.1f}")
+    lines.append(f"   _({det_info} │ розкид:{fc['max_spread']:.1f}°C)_")
+    # ── 1.5 Кліматологія ──
+    climo = fc.get("climo")
+    days_ahead = fc.get("days_ahead", 0)
+    if climo and days_ahead >= 3:
+        lines.append(
+            f"\n📅 *Кліматологія ERA5 {climo['years']}р:*"
+            f" μ={climo['climo_mean']:.1f}°C σ={climo['climo_std']:.1f}°C"
+            f" (min:{climo['climo_min']}–max:{climo['climo_max']}°C)"
+        )
     lines.append(f"   _Довіра: {fc['confidence']}_")
     return "\n".join(lines)
 
@@ -856,7 +1149,7 @@ def fmt_polymarket(dt: datetime, outcomes: dict,
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🇬🇧 London"),       KeyboardButton("🇩🇪 Munich")],
+        [KeyboardButton("🇵🇱 Warsaw"),       KeyboardButton("🇬🇧 London"),     KeyboardButton("🇩🇪 Munich")],
         [KeyboardButton("🌡️ Макс"),          KeyboardButton("❄️ Мін")],
         [KeyboardButton("📅 Сьогодні"),      KeyboardButton("🔍 Завтра"),  KeyboardButton("📅 Після завтра")],
         [KeyboardButton("📊 Polymarket"),    KeyboardButton("📈 Позиції"), KeyboardButton("📉 Тренд")],
@@ -892,43 +1185,378 @@ def positions_keyboard(positions: dict) -> InlineKeyboardMarkup:
 
 
 
+
+
+def fetch_metar(station: str) -> dict | None:
+    """
+    1.4 METAR реального часу з авіаційних джерел.
+    Використовується в день резолюції щоб знати поточну температуру EGLC/EDDM.
+    Безкоштовний API: aviationweather.gov (NOAA)
+    """
+    data = _safe_get(
+        "https://aviationweather.gov/api/data/metar",
+        params={"ids": station, "format": "json", "taf": "false"}
+    )
+    if not data or not isinstance(data, list) or not data:
+        return None
+
+    obs = data[0]
+    temp_c = obs.get("temp")
+    if temp_c is None:
+        return None
+
+    return {
+        "station":  station,
+        "temp_c":   float(temp_c),
+        "obs_time": obs.get("reportTime", ""),
+        "wind_kt":  obs.get("wdir", 0),
+        "vis_sm":   obs.get("visib", 0),
+        "raw":      obs.get("rawOb", ""),
+    }
+
+
+def get_metar_for_city(city: str) -> dict | None:
+    """Повертає METAR для відповідної станції міста."""
+    station = CITIES.get(city, {}).get("station", "EGLC")
+    return fetch_metar(station)
+
+
+
+def fetch_climatology(dt: datetime, city: str = "london",
+                      market_type: str = "highest", years: int = 5) -> dict | None:
+    """
+    1.5 NOAA/ERA5 кліматологія — базовий рівень температури.
+    Тягне ERA5 за той самий день ± 3 дні за останні N років.
+    Дає historical base rate: яка температура була у цей день протягом 5 років.
+
+    Використовується як додатковий prior до Bayesian оцінки.
+    """
+    cfg = CITIES.get(city, CITIES["london"])
+    lat, lon = cfg["lat"], cfg["lon"]
+    tz = cfg["tz"]
+
+    year_temps = []
+    current_year = dt.year
+
+    for y_offset in range(1, years + 1):
+        year = current_year - y_offset
+        # Запитуємо ±3 дні навколо тієї самої дати
+        for d_offset in range(-2, 3):
+            check_dt = dt.replace(year=year) + __import__('datetime').timedelta(days=d_offset)
+            ds = check_dt.strftime("%Y-%m-%d")
+            data = _safe_get(
+                "https://archive-api.open-meteo.com/v1/archive",
+                params={
+                    "latitude": lat, "longitude": lon,
+                    "hourly": "temperature_2m",
+                    "timezone": tz,
+                    "start_date": ds, "end_date": ds,
+                }
+            )
+            if not data:
+                continue
+            tmax, tmin, _, _ = _hourly_max(data, ds)
+            val = tmin if market_type == "lowest" else tmax
+            if val is not None:
+                year_temps.append(val)
+
+    if not year_temps:
+        return None
+
+    n      = len(year_temps)
+    mean   = round(sum(year_temps) / n, 2)
+    var    = sum((x - mean) ** 2 for x in year_temps) / n
+    std    = round(var ** 0.5, 2)
+
+    return {
+        "climo_mean": mean,
+        "climo_std":  std,
+        "climo_n":    n,
+        "climo_min":  round(min(year_temps), 1),
+        "climo_max":  round(max(year_temps), 1),
+        "years":      years,
+    }
+
 def fetch_archive_forecast(dt: datetime, city: str = "london") -> dict | None:
     """
     Тягне архівні дані Open-Meteo ERA5 для заданої дати і міста.
     Використовується в /actual коли прогноз не збережено в кеші.
-    ERA5 — реальні виміряні дані, не прогноз, але дозволяє розрахувати
-    що б прогнозували моделі (через Historical Forecast API).
+    Спочатку пробує Iowa State ASOS (реальний сенсор EGLC/EDDM),
+    потім fallback на ERA5 reanalysis.
     """
     cfg = CITIES.get(city, CITIES["london"])
     lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
     ds = dt.strftime("%Y-%m-%d")
 
-    # ERA5 reanalysis — найточніший ретроспективний датасет
+    # Спочатку ASOS — реальний сенсор
+    station = cfg["station"]
+    asos = fetch_asos_actual(station, dt)
+    if asos:
+        tmax = asos["tmax_c"]
+        tmin = asos["tmin_c"]
+        source_label = f"ASOS {station}"
+    else:
+        # Fallback ERA5
+        data = _safe_get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={
+                "latitude": lat, "longitude": lon,
+                "hourly": "temperature_2m",
+                "timezone": tz,
+                "start_date": ds, "end_date": ds,
+            }
+        )
+        if not data:
+            return None
+        tmax, tmin, _, _ = _hourly_max(data, ds)
+        if tmax is None:
+            return None
+        source_label = "ERA5 reanalysis"
+
+    return {
+        "ECMWF":         tmax,
+        "DWD ICON":      round(tmax - 0.1, 1),
+        "UK Met Office": round(tmax + 0.1, 1),
+        "Meteo-France":  tmax,
+        "final":         tmax,
+        "month":         dt.month,
+        "_source":       source_label,
+    }
+
+
+# ══════════════════════════════════════════════════════
+# AUTO MOS — автоматичне навчання через Previous Runs API
+# ══════════════════════════════════════════════════════
+
+def fetch_previous_run_forecast(target_date: datetime, city: str = "london",
+                                 lead_days: int = 1) -> dict | None:
+    """
+    Previous Runs API: що модель прогнозувала N днів тому для target_date.
+    lead_days=1 → прогноз зроблений вчора для сьогодні (найточніший)
+    lead_days=2 → прогноз зроблений позавчора
+    lead_days=3 → прогноз за 3 дні (типовий горизонт покупки ставки)
+
+    Endpoint: https://previous-runs-api.open-meteo.com/v1/forecast
+    Data from: January 2024 onwards
+    """
+    cfg = CITIES.get(city, CITIES["london"])
+    lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
+    ds = target_date.strftime("%Y-%m-%d")
+
+    results = {}
+    # Підтримувані моделі в Previous Runs API
+    model_map = {
+        "ECMWF":        ("ecmwf_ifs04", "https://previous-runs-api.open-meteo.com/v1/forecast"),
+        "DWD ICON":     ("icon_seamless", "https://previous-runs-api.open-meteo.com/v1/forecast"),
+        "Meteo-France": ("meteofrance_seamless", "https://previous-runs-api.open-meteo.com/v1/forecast"),
+    }
+
+    for model_name, (model_param, base_url) in model_map.items():
+        data = _safe_get(base_url, params={
+            "latitude":    lat,
+            "longitude":   lon,
+            "hourly":      f"temperature_2m_day{lead_days}",
+            "timezone":    tz,
+            "start_date":  ds,
+            "end_date":    ds,
+            "models":      model_param,
+        })
+        if not data:
+            continue
+
+        hourly = data.get("hourly", {})
+        times  = hourly.get("time", [])
+        key    = f"temperature_2m_day{lead_days}"
+        temps  = hourly.get(key, [])
+
+        day_temps = [
+            float(temps[i]) for i, t in enumerate(times)
+            if t.startswith(ds) and i < len(temps) and temps[i] is not None
+        ]
+        if day_temps:
+            results[model_name] = {
+                "max": max(day_temps),
+                "min": min(day_temps),
+                "lead_days": lead_days,
+            }
+
+    return results if results else None
+
+
+
+def fetch_asos_actual(station: str, date: datetime) -> dict | None:
+    """
+    Iowa State ASOS API — реальні погодинні виміри температури зі станції.
+    Для EGLC і EDDM дає той самий фізичний сенсор що використовує Wunderground.
+
+    Безкоштовно, без API key, глобальні станції.
+    network=GB__ASOS для UK, DE__ASOS для Німеччини.
+
+    Повертає: {"tmax_c": float, "tmin_c": float, "readings": int, "source": "ASOS"}
+    """
+    ds   = date.strftime("%Y-%m-%d")
+    sts  = f"{ds}T00:00:00Z"
+    ets  = f"{ds}T23:59:00Z"
+
     data = _safe_get(
-        "https://archive-api.open-meteo.com/v1/archive",
+        "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py",
         params={
-            "latitude": lat, "longitude": lon,
-            "hourly": "temperature_2m,cloud_cover,windspeed_10m",
-            "timezone": tz,
-            "start_date": ds, "end_date": ds,
+            "station":  station,
+            "data":     "tmpc",      # температура в Celsius
+            "sts":      sts,
+            "ets":      ets,
+            "format":   "json",
+            "tz":       "UTC",
+            "missing":  "null",
         }
     )
     if not data:
         return None
 
-    tmax, tmin, cloud, wind = _hourly_max(data, ds)
-    if tmax is None:
+    obs_list = data.get("data", [])
+    if not obs_list:
+        return None
+
+    temps = []
+    for obs in obs_list:
+        t = obs.get("tmpc")
+        if t is not None:
+            try:
+                temps.append(float(t))
+            except (ValueError, TypeError):
+                pass
+
+    if not temps:
         return None
 
     return {
-        "ECMWF":          round(tmax, 1),
-        "DWD ICON":       round(tmax - 0.1, 1),  # невелика варіація між моделями
-        "UK Met Office":  round(tmax + 0.1, 1),
-        "Meteo-France":   round(tmax, 1),
-        "final":          round(tmax, 1),
-        "month":          dt.month,
-        "_source":        "ERA5 archive (ретроспективний)",
+        "tmax_c":   round(max(temps), 1),
+        "tmin_c":   round(min(temps), 1),
+        "readings": len(temps),
+        "source":   f"ASOS {station} (реальний сенсор)",
     }
+
+def auto_update_mos(city: str = "london") -> dict:
+    """
+    Автоматично оновлює MOS для вчорашньої дати:
+    1. Тягне що моделі прогнозували вчора (lead=1) і позавчора (lead=2)
+    2. Тягне ERA5 факт за вчора
+    3. Рахує похибку і записує в SOURCE_STATS
+
+    Запускається щоночі о 01:00 (після того як ERA5 оновиться).
+    Повертає dict з результатами оновлення.
+    """
+    yesterday = (datetime.utcnow() - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    month = yesterday.month
+    cfg   = CITIES.get(city, CITIES["london"])
+    results = {"date": yesterday.strftime("%d.%m.%Y"), "city": city, "updates": []}
+
+    # ASOS факт за вчора — реальний сенсор EGLC/EDDM (не ERA5 reanalysis!)
+    station = cfg["station"]  # EGLC або EDDM
+    asos = fetch_asos_actual(station, yesterday)
+
+    if asos:
+        tmax = asos["tmax_c"]
+        tmin = asos["tmin_c"]
+        results["actual_max"]    = tmax
+        results["actual_min"]    = tmin
+        results["actual_source"] = asos["source"]
+        results["readings"]      = asos["readings"]
+        logger.info("ASOS %s: tmax=%.1f tmin=%.1f (%d readings)",
+                    station, tmax, tmin, asos["readings"])
+    else:
+        # Fallback на ERA5 якщо ASOS недоступний
+        logger.warning("ASOS %s unavailable, falling back to ERA5", station)
+        ds   = yesterday.strftime("%Y-%m-%d")
+        era5 = _safe_get("https://archive-api.open-meteo.com/v1/archive", params={
+            "latitude": cfg["lat"], "longitude": cfg["lon"],
+            "hourly": "temperature_2m", "timezone": cfg["tz"],
+            "start_date": ds, "end_date": ds,
+        })
+        if not era5:
+            results["error"] = "ASOS і ERA5 недоступні"
+            return results
+        tmax, tmin, _, _ = _hourly_max(era5, ds)
+        if tmax is None:
+            results["error"] = "Немає даних"
+            return results
+        results["actual_max"]    = tmax
+        results["actual_min"]    = tmin
+        results["actual_source"] = "ERA5 fallback"
+
+    # Прогнози за 1 і 2 дні наперед
+    for lead in [1, 2]:
+        prev_forecasts = fetch_previous_run_forecast(yesterday, city=city, lead_days=lead)
+        if not prev_forecasts:
+            continue
+
+        for model_name, fc_data in prev_forecasts.items():
+            predicted_max = fc_data["max"]
+            predicted_min = fc_data["min"]
+
+            # Оновлюємо bias для max і min
+            error_max = predicted_max - tmax
+            error_min = predicted_min - tmin
+
+            # Зберігаємо як "ECMWF_lead1" та "ECMWF_lead2"
+            src_key = f"{model_name}_lead{lead}"
+            record_actual(src_key, month, predicted_max, tmax)
+
+            results["updates"].append({
+                "model":       model_name,
+                "lead":        lead,
+                "predicted":   predicted_max,
+                "actual":      tmax,
+                "error":       round(error_max, 2),
+            })
+            logger.info(
+                "Auto MOS %s %s lead%d: pred=%.1f actual=%.1f err=%+.1f",
+                city, model_name, lead, predicted_max, tmax, error_max
+            )
+
+    return results
+
+
+async def job_auto_mos(context) -> None:
+    """
+    Щонічний job о 01:00 Kyiv:
+    Автоматично оновлює MOS для обох міст без участі користувача.
+    """
+    summary_lines = ["🧠 *Авто MOS оновлення*\n"]
+
+    for city in CITIES:
+        result = auto_update_mos(city)
+        cfg    = CITIES[city]
+
+        if "error" in result:
+            summary_lines.append(f"{cfg['emoji']} {result.get('error')}")
+            continue
+
+        era5_max = result.get("actual_max", "?")
+        src_label = result.get("actual_source", "ERA5")
+        updates  = result.get("updates", [])
+        summary_lines.append(
+            f"{cfg['emoji']} *{cfg['name']}* {result['date']}: факт {era5_max:.1f}°C ({src_label})"
+        )
+        for u in updates:
+            summary_lines.append(
+                f"  {u['model']} lead{u['lead']}д: "
+                f"прогноз {u['predicted']:.1f}→факт {u['actual']:.1f}°C "
+                f"(помилка {u['error']:+.1f}°C)"
+            )
+
+    # Надсилаємо тільки якщо є оновлення
+    total_updates = sum(len(auto_update_mos(c).get("updates", [])) for c in CITIES)
+    if total_updates > 0 or True:  # завжди надсилаємо для контролю
+        try:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text="\n".join(summary_lines),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error("Auto MOS notify: %s", e)
 
 async def _send_full_report(bot: Bot, dt: datetime,
                              chat_id: str | int, label: str = "🔍",
@@ -1206,39 +1834,52 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     lines = [
-        "🤖 PolyWeather Bot v4.1",
+        "🤖 PolyWeather Bot v4.2",
         f"chat_id: {cid}",
         "",
         "━━━ 🌍 МІСТО ━━━",
-        "Кнопки: 🇬🇧 London / 🇩🇪 Munich",
-        "Ключі: london, munich",
+        "Кнопки: 🇵🇱 Warsaw / 🇬🇧 London / 🇩🇪 Munich",
+        "Warsaw — пріоритетний (найбільший обсяг ~$90K/день)",
+        "Ключі: warsaw, london, munich",
+        "За замовчуванням: warsaw",
         "",
         "━━━ 🌡️ ТИП РИНКУ ━━━",
         "Кнопки: 🌡️ Макс / ❄️ Мін",
-        "  🌡️ Макс — Highest temperature (max за день)",
-        "  ❄️ Мін  — Lowest temperature (min за ніч/ранок)",
-        "Або явно в команді: highest / lowest / max / min",
+        "  🌡️ Макс — Highest temperature (денний максимум)",
+        "  ❄️ Мін  — Lowest temperature (нічний мінімум)",
+        "В команді: highest/max або lowest/min",
         "",
         "━━━ 📊 ПРОГНОЗ ━━━",
         "Кнопки: Сьогодні / Завтра / Після завтра",
         "/check [тип] [місто] [DD.MM]",
-        "  /check — макс London завтра",
+        "  /check — макс Warsaw завтра (за замовч.)",
+        "  /check today — сьогодні",
+        "  /check warsaw 06.05 — Warsaw 6 травня",
         "  /check lowest london 01.05 — мін London",
         "  /check highest munich 02.05 — макс Munich",
-        "  /check today — сьогодні",
         "/check2 — завтра + після завтра",
-        "/forecast [місто] [DD.MM] — лише погода (4 моделі)",
+        "/forecast [місто] [DD.MM] — лише погода",
         "/poll [місто] [DD.MM] — лише Polymarket",
         "",
-        "4 моделі: ECMWF + DWD ICON + UK Met Office + Meteo-France",
+        "Прогноз: 4 NWP + 2 Ensemble + METAR + Кліматологія",
+        "  NWP: ECMWF + DWD ICON + UK Met Office + Meteo-France",
+        "  Ensemble: GFS ENS (31) + ECMWF ENS (51 членів)",
+        "  METAR: реальний сенсор EPWA/EGLC/EDDM (в день резолюції)",
+        "  Кліматологія ERA5: 5 років для горизонту 3+ днів",
         "",
         "━━━ 💰 КУПІВЛЯ /buy ━━━",
         "Формат: /buy [місто] <темп> [DD.MM] [опції]",
         "",
-        "  /buy 19 — London макс завтра, 19C",
-        "  /buy 19 02.05 — London макс 2 травня",
-        "  /buy london 19 02.05 — явно London",
-        "  /buy munich 20 02.05 — Munich",
+        "Приклади Warsaw (пріоритет):",
+        "  /buy 22 — Warsaw макс завтра, 22C",
+        "  /buy 22 06.05 — Warsaw 6 травня",
+        "  /buy warsaw 22 06.05 — явно Warsaw",
+        "  /buy warsaw 22 06.05 --price 30 --amount 50",
+        "  /buy warsaw 22 06.05 --price 30 --amount 50 --stop 15 --tp 65",
+        "",
+        "Приклади London / Munich:",
+        "  /buy london 19 02.05 --amount 30",
+        "  /buy munich 20 02.05 --price 29 --amount 20",
         "",
         "Опції:",
         "  --price X   — ціна покупки, %",
@@ -1246,72 +1887,70 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  --stop X    — стоп-лос при падінні до X%",
         "  --tp X      — тейк-профіт при X%",
         "",
-        "Повний приклад:",
-        "  /buy london 21 02.05 --price 30 --amount 50 --stop 15 --tp 65",
-        "",
         "Кілька позицій на одну дату:",
-        "  /buy 19 02.05 --amount 30",
-        "  /buy 21 02.05 --amount 20  <- окрема!",
+        "  /buy 21 06.05 --amount 30",
+        "  /buy 22 06.05 --amount 20  <- окрема!",
         "",
         "━━━ 📤 ЗАКРИТТЯ /sell ━━━",
         "  /sell — єдина активна",
-        "  /sell 02.05 — всі на цю дату",
-        "  /sell 02.05 19 — тільки 19C",
+        "  /sell 06.05 — всі на цю дату",
+        "  /sell 06.05 22 — тільки 22C",
+        "  /sell warsaw 06.05 22 — Warsaw 22C",
         "  /sell london 02.05 19 — London 19C",
         "  /sell munich 02.05 20 — Munich 20C",
         "  /sell all — закрити всі",
+        "  /sell 06.05 22 --price 65.0 — закрив за 65%",
         "",
-        "━━━ 📈 ПЕРЕГЛЯД ━━━",
+        "━━━ 📈 ПОЗИЦІЇ ━━━",
         "  /positions — всі позиції + ROI + USD",
         "  /trend — тренд по всіх позиціях",
-        "  /trend 02.05 — тренд конкретної",
+        "  /trend 06.05 — тренд конкретної дати",
         "",
         "━━━ 🧠 НАВЧАННЯ ━━━",
-        "Після дня вводь фактичну температуру:",
-        "  /actual 16.5 — London (EGLC) за вчора",
-        "  /actual london 16.5 — London явно",
-        "  /actual munich 20.1 — Munich (EDDM) за вчора",
-        "  /actual london 16.5 28.04 — конкретний день",
-        "  /actual munich 20.1 28.04 — Munich конкретний день",
+        "Факт автоматично записується щоночі о 01:00!",
+        "(Previous Runs API + Iowa State ASOS EPWA/EGLC/EDDM)",
         "",
-        "Якщо прогноз не збережено — бот автоматично",
-        "завантажить ERA5 архів з Open-Meteo.",
+        "Ручний запис:",
+        "  /actual 21.5 — Warsaw (EPWA) за вчора",
+        "  /actual warsaw 21.5 — Warsaw явно",
+        "  /actual london 16.5 — London (EGLC)",
+        "  /actual munich 20.1 — Munich (EDDM)",
+        "  /actual warsaw 21.5 06.05 — конкретний день",
         "",
         "  /history — точність всіх моделей",
+        "  /history warsaw — тільки Warsaw",
         "  /history london — тільки London",
         "  /history munich — тільки Munich",
         "",
+        "━━━ 💼 ПОРТФЕЛЬ ━━━",
+        "  /portfolio — статистика балансу і угод",
+        "  /portfolio set 500 — початковий баланс $500",
+        "  /portfolio set 500 450 — поч. + поточний",
+        "  /portfolio trades — журнал угод",
+        "  /portfolio reset — скинути журнал",
+        "",
         "━━━ ⏰ АВТОМАТИКА ━━━",
-        "07:30 — ранковий брифінг",
+        "01:00 — авто MOS (Iowa ASOS факт + Previous Runs)",
+        "07:30 — ранковий брифінг (Warsaw першим)",
         "09:00 — скан нових ринків (BUY < 38%)",
         "14:00 — денний звіт",
         "Кожні 2 хв — моніторинг цін позицій",
         "Кожні 30 хв — зміна прогнозу погоди",
         "  /briefing — вручну",
         "",
-        "━━━ 💼 ПОРТФЕЛЬ ━━━",
-        "/portfolio — статистика балансу і угод",
-        "/portfolio set 500 — встановити початковий баланс",
-        "/portfolio set 500 450 — поч. + поточний баланс",
-        "/portfolio trades — журнал останніх угод",
-        "/portfolio reset — скинути журнал",
-        "",
-        "При закритті вказуй ціну:",
-        "  /sell 02.05 19 --price 62.0 — закрив за 62%",
-        "  /sell 02.05 19 — закрив по ринку (поточна ціна)",
-        "",
         "━━━ 🔔 АЛЕРТИ ━━━",
         "Рівні: 40 → 50 → 60 → 70 → 80 → 90%",
         "Стоп-лос / Тейк-профіт / Momentum / Прогноз",
         "",
         "━━━ 💾 ДАНІ ━━━",
-        "Всі дані зберігаються на диску.",
-        "Render Disk: встанови DATA_DIR=/data",
+        "Render Disk: DATA_DIR=/data (не злітають при деплої)",
         "",
         "━━━ 📡 СТАНЦІЇ ━━━",
+        "🇵🇱 Warsaw: EPWA (Warsaw Chopin Airport) ← ПРІОРИТЕТ",
         "🇬🇧 London: EGLC (London City Airport)",
         "🇩🇪 Munich: EDDM (Munich Airport)",
-        "Джерело resolution: Wunderground",
+        "Resolution: Wunderground (EPWA/EGLC/EDDM)",
+        "Факт: Iowa State ASOS (реальний сенсор)",
     ]
     await update.message.reply_text(
         "\n".join(lines),
@@ -1359,7 +1998,7 @@ async def cmd_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if err: await update.message.reply_text(err, parse_mode="Markdown"); return
     fc = compute_forecast(dt)
     if "error" in fc: await update.message.reply_text(f"⚠️ {fc['error']}"); return
-    poll_city = getattr(context, "_city", None) or selected_city.get(update.effective_chat.id, "london")
+    poll_city = getattr(context, "_city", None) or selected_city.get(update.effective_chat.id, "warsaw")
     _, markets, link = get_polymarket_data(dt, poll_city)
     outcomes          = parse_all_outcomes(markets) if markets else {}
     tgt_lbl, tgt_pct = find_outcome_for_temp(outcomes, fc["final_int"]) if outcomes else (None, None)
@@ -1735,7 +2374,10 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     filter_city = args[0].lower() if args and args[0].lower() in CITIES else None
 
     lines = []
-    for city_key, city_cfg in CITIES.items():
+    # Warsaw перший (пріоритетний), потім London, Munich
+    city_order = ["warsaw", "london", "munich"]
+    city_items = sorted(CITIES.items(), key=lambda x: city_order.index(x[0]) if x[0] in city_order else 99)
+    for city_key, city_cfg in city_items:
         if filter_city and city_key != filter_city:
             continue
         station = city_cfg["station"]
@@ -1749,6 +2391,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         city_lines = [f"📊 *{emoji} {name} ({station})*\n"]
         has_data = False
 
+        # Показуємо і базові моделі і auto MOS lead1/lead2
         for model_name, months in SOURCE_STATS.items():
             month_lines = []
             for mk, st in sorted(months.items(), key=lambda x: int(x[0])):
@@ -2101,7 +2744,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     cid     = update.effective_chat.id
     # Поточне вибране місто
-    city        = selected_city.get(cid, "london")
+    city        = selected_city.get(cid, "warsaw")  # Warsaw пріоритет
     city_cfg    = CITIES[city]
     market_type = selected_market_type.get(cid, "highest")
 
@@ -2120,7 +2763,14 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     # Вибір міста
-    if text == "🇬🇧 London":
+    if text == "🇵🇱 Warsaw":
+        selected_city[cid] = "warsaw"
+        save_selected_city()
+        await update.message.reply_text(
+            "🇵🇱 Вибрано Warsaw (EPWA). Всі запити тепер для Варшави.",
+            reply_markup=main_keyboard())
+        return
+    elif text == "🇬🇧 London":
         selected_city[cid] = "london"
         save_selected_city()
         await update.message.reply_text(
@@ -2239,6 +2889,9 @@ def main() -> None:
     kyiv_9   = datetime.now(KYIV_TZ).replace(hour=9,  minute=0,  second=0, microsecond=0)
     kyiv_14  = datetime.now(KYIV_TZ).replace(hour=14, minute=0,  second=0, microsecond=0)
 
+    # Авто MOS о 01:00 — ERA5 вже оновився за вчора
+    kyiv_100 = datetime.now(KYIV_TZ).replace(hour=1, minute=0, second=0, microsecond=0)
+    jq.run_daily(job_auto_mos, time=kyiv_100.timetz(), name="auto_mos")
     jq.run_daily(job_morning_briefing, time=kyiv_730.timetz(), name="briefing_730")
     jq.run_daily(job_market_scan,      time=kyiv_9.timetz(),   name="market_scan_9")
     jq.run_daily(job_daily_14,         time=kyiv_14.timetz(),  name="daily_14")
