@@ -329,6 +329,67 @@ def check_forecast_change(dt: datetime, new_final: float) -> tuple[bool, float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  MONITORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+monitoring: dict[str, dict] = {}
+
+
+def _monitoring_to_json(m: dict) -> dict:
+    """Серіалізує monitoring для збереження (datetime → str)."""
+    out = {}
+    for dk, state in m.items():
+        s = dict(state)
+        if isinstance(s.get("target_date"), datetime):
+            s["target_date"] = s["target_date"].isoformat()
+        out[dk] = s
+    return out
+
+
+def _monitoring_from_json(data: dict) -> dict:
+    """Десеріалізує monitoring (str → datetime)."""
+    out = {}
+    for dk, state in data.items():
+        s = dict(state)
+        if isinstance(s.get("target_date"), str):
+            try:
+                s["target_date"] = datetime.fromisoformat(s["target_date"])
+            except Exception:
+                continue  # пропускаємо некоректні записи
+        out[dk] = s
+    return out
+
+
+def save_monitoring() -> None:
+    """Зберігає активні позиції на диск."""
+    try:
+        MONITORING_FILE.write_text(json.dumps(_monitoring_to_json(monitoring), indent=2))
+    except Exception as e:
+        logger.error("Save monitoring: %s", e)
+
+
+def load_monitoring() -> None:
+    """Завантажує позиції при старті."""
+    global monitoring
+    if MONITORING_FILE.exists():
+        try:
+            data = json.loads(MONITORING_FILE.read_text())
+            monitoring = _monitoring_from_json(data)
+            active = sum(1 for s in monitoring.values() if s.get("active"))
+            logger.info("Monitoring loaded: %d positions (%d active)", len(monitoring), active)
+        except Exception as e:
+            logger.warning("Load monitoring: %s", e)
+
+
+def _date_key(dt: datetime) -> str: return dt.strftime("%Y-%m-%d")
+
+
+def _days_label(dt: datetime) -> str:
+    d = (dt.date() - datetime.utcnow().date()).days
+    return {0:" (сьогодні)",1:" (завтра)",2:" (після завтра)"}.get(d, f" (через {d} дн.)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  WEATHER — 3 найточніші моделі для Лондона
 # ══════════════════════════════════════════════════════════════════════════════
 
