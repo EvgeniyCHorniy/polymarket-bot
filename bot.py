@@ -26,6 +26,19 @@ London EGLC Temperature Polymarket Bot v4
   6. Кнопки (Reply Keyboard) — не треба пам'ятати команди
      + Inline кнопки під позиціями (Закрити / Тренд)
 
+НОВЕ в v4.3 — NO HUNTER:
+  7. NO Hunter — пошук ринків де варто ставити НІ:
+     - Сканує всі активні ринки Polymarket (Gamma API)
+     - Фільтр: YES 83–97%, об'єм >$10k, до 20 днів до резолюції
+     - Аналіз rules: timezone ET, фізична присутність, множинні умови,
+       дискреційна резолюція, згадки скасування
+     - Новинний ризик: ключові слова (iran, war, cancel, postpone...)
+     - NO Score 0–100: rules×40% + news×25% + payoff×25% + час×10%
+     - Авто-скан о 09:30 Kyiv (тільки score >= 50)
+     /no_scan        — топ-5 кандидатів
+     /no_scan 10     — топ-10
+     /no_scan --min 50 — мінімальний score 50
+
 ВСТАНОВЛЕННЯ:
   pip install "python-telegram-bot[job-queue]==20.*" requests pytz
 
@@ -887,6 +900,253 @@ def find_outcome_for_temp(outcomes: dict, temp: int) -> tuple[str | None, float 
             d = abs(int(m.group(1)) - temp)
             if d < best_d: best_d, best_lbl, best_pct = d, lbl, pct
     return best_lbl, best_pct
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NO HUNTER — шукає ринки де реальна ймовірність NO вища за ринкову ціну
+#  Вставити після функції polymarket_consensus() (~після рядка з "return")
+# ══════════════════════════════════════════════════════════════════════════════
+
+import math as _math
+
+# Параметри фільтрації
+NO_HUNTER_YES_MIN    = 0.83   # мінімальна ціна YES (нижче — вже і так ризик відомий)
+NO_HUNTER_YES_MAX    = 0.97   # вище — NO занадто дешевий, ліквідності немає
+NO_HUNTER_MIN_VOL    = 10_000 # мінімальний об'єм ринку в USD
+NO_HUNTER_MAX_DAYS   = 20     # максимум днів до резолюції
+NO_HUNTER_MIN_DAYS   = 1      # мінімум
+NO_HUNTER_MIN_SCORE  = 35     # мінімальний NO Score для алерту (0–100)
+
+# Паттерни в тексті rules що підвищують ризик NO
+_RULES_RISK_PATTERNS = [
+    # Timezone / deadline ризики
+    (r'\b(ET|EST|EDT|eastern time)\b',          0.18, "⏰ Точний timezone ET — можливий mismatch"),
+    (r'11:59\s*(pm|PM|ET)',                      0.15, "⏰ Deadline 11:59 PM ET — граничний час"),
+    (r'by\s+\w+\s+\d+.*?\d{2}:\d{2}',           0.10, "⏰ Точний дедлайн — ризик граничного часу"),
+
+    # Вузькі фізичні умови
+    (r'physically entering|physical presence',   0.20, "📍 Потрібна фізична присутність"),
+    (r'terrestrial or maritime territory',        0.12, "📍 Виключено повітряний простір"),
+    (r'signed into law|enacts|officially signs', 0.15, "✍️ Потрібна офіційна дія (підпис)"),
+    (r'takes effect|enters into force',          0.12, "⚖️ Потрібне набрання чинності"),
+
+    # Ambiguous / суб'єктивне джерело
+    (r'credible reports|consensus of.*?report',  0.10, "📰 Суб'єктивне джерело резолюції"),
+    (r'at.*?discretion|may.*?resolve',           0.18, "🎲 Дискреційна резолюція"),
+    (r'if.*?deemed|as determined by',            0.12, "🎲 Умовна резолюція"),
+
+    # Складні множинні умови
+    (r'and.*?and.*?and|all of the following',    0.15, "🔗 Множинні умови (всі мають виконатись)"),
+    (r'\bunless\b|\bexcept\b|\bprovided that\b', 0.10, "⚠️ Є виключення в умовах"),
+
+    # Cancelled / postponed ризик
+    (r'postponed|rescheduled|delayed',           0.08, "🔄 Вже переносилось раніше"),
+    (r'cancelled|canceled|called off',           0.20, "❌ Ризик скасування згаданий в rules"),
+]
+
+
+def _rules_risk_score(rules_text: str) -> tuple[float, list[str]]:
+    """Аналізує текст rules і повертає (risk 0–1, список flags)."""
+    import re
+    if not rules_text:
+        return 0.05, ["Rules недоступні"]
+    risk  = 0.0
+    flags = []
+    text  = rules_text.lower()
+    for pattern, weight, desc in _RULES_RISK_PATTERNS:
+        if re.search(pattern, text, re.I):
+            risk  += weight
+            flags.append(desc)
+    return min(risk, 1.0), flags
+
+
+def _web_search_risk(question: str) -> tuple[float, str]:
+    """
+    Простий web search через Gamma market context + заголовок.
+    Повертає (risk 0–1, короткий summary).
+    Без зовнішнього API — аналізуємо тільки назву ринку на ключові слова ризику.
+    Для повноцінного пошуку — розширити через requests до SerpAPI/Serper.
+    """
+    import re
+    q = question.lower()
+    risk  = 0.0
+    notes = []
+
+    # Ключові слова що підвищують ризик NO
+    cancel_words = ["iran", "war", "conflict", "delay", "postpone", "cancel",
+                    "ceasefire", "peace", "deal", "negotiat", "sanction"]
+    for w in cancel_words:
+        if w in q:
+            risk  += 0.08
+            notes.append(w)
+
+    # Ключові слова що знижують ризик NO (підтверджено)
+    confirm_words = ["confirmed", "scheduled", "announced", "planned",
+                     "set for", "will visit", "has signed"]
+    for w in confirm_words:
+        if w in q:
+            risk = max(0.0, risk - 0.05)
+
+    risk    = min(risk, 0.60)
+    summary = f"Ключові слова: {', '.join(notes[:3])}" if notes else "Без тривожних сигналів"
+    return risk, summary
+
+
+def _no_score(yes_price: float, days_left: float,
+              rules_risk: float, news_risk: float) -> float:
+    """
+    Фінальний NO Score 0–100.
+    Враховує: payoff ratio, rules ризик, news ризик, часовий фактор.
+    """
+    no_price = 1.0 - yes_price
+    if no_price <= 0:
+        return 0.0
+
+    # Payoff: скільки заробимо якщо NO (нормалізовано 0–1)
+    payoff_ratio = (1.0 - no_price) / no_price  # напр. 11.5x при NO=8¢
+    payoff_norm  = min(payoff_ratio / 20.0, 1.0) # cap at 20x
+
+    # Time decay: ближче до резолюції — вища визначеність
+    time_norm = max(0.0, 1.0 - days_left / NO_HUNTER_MAX_DAYS)
+
+    # Зважений score
+    score = (
+        payoff_norm  * 0.25 +
+        rules_risk   * 0.40 +
+        news_risk    * 0.25 +
+        time_norm    * 0.10
+    ) * 100
+
+    return round(score, 1)
+
+
+def scan_no_opportunities(limit: int = 50) -> list[dict]:
+    """
+    Головна функція NO Hunter.
+    Сканує активні ринки Polymarket і повертає відсортований список кандидатів.
+    """
+    import re
+    from datetime import timezone as _tz
+
+    # Тягнемо активні ринки з Gamma API
+    data = _safe_get(
+        "https://gamma-api.polymarket.com/markets",
+        params={
+            "active":   "true",
+            "closed":   "false",
+            "limit":    limit,
+            "order":    "volume24hr",
+            "ascending":"false",
+        }
+    )
+    if not data or not isinstance(data, list):
+        logger.error("NO Hunter: Gamma API повернув порожній результат")
+        return []
+
+    candidates = []
+    now_dt     = datetime.utcnow().replace(tzinfo=_tz.utc)
+
+    for market in data:
+        # ── Базові поля ──
+        question   = market.get("question", "")
+        end_date_s = market.get("endDate") or market.get("endDateIso") or ""
+        volume     = float(market.get("volume", 0) or 0)
+        prices_raw = market.get("outcomePrices", "[]")
+
+        if isinstance(prices_raw, str):
+            try:    prices = json.loads(prices_raw)
+            except: prices = []
+        else:
+            prices = prices_raw or []
+
+        # Беремо YES ціну (перший outcome = YES)
+        try:    yes_price = float(prices[0])
+        except: continue
+
+        # ── Фільтр 1: ціна YES в діапазоні ──
+        if not (NO_HUNTER_YES_MIN <= yes_price <= NO_HUNTER_YES_MAX):
+            continue
+
+        # ── Фільтр 2: об'єм ──
+        if volume < NO_HUNTER_MIN_VOL:
+            continue
+
+        # ── Фільтр 3: кількість днів до резолюції ──
+        if not end_date_s:
+            continue
+        try:
+            # Polymarket повертає ISO формат
+            end_dt = datetime.fromisoformat(end_date_s.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=_tz.utc)
+            days_left = (end_dt - now_dt).total_seconds() / 86400
+        except Exception:
+            continue
+
+        if not (NO_HUNTER_MIN_DAYS <= days_left <= NO_HUNTER_MAX_DAYS):
+            continue
+
+        # ── Аналіз rules ──
+        rules_text  = market.get("description", "") or ""
+        rules_risk, rules_flags = _rules_risk_score(rules_text)
+
+        # ── Новинний ризик (по заголовку) ──
+        news_risk, news_summary = _web_search_risk(question)
+
+        # ── Фінальний score ──
+        score = _no_score(yes_price, days_left, rules_risk, news_risk)
+
+        if score < NO_HUNTER_MIN_SCORE:
+            continue
+
+        no_price = round(1.0 - yes_price, 3)
+        candidates.append({
+            "market_id":    market.get("id", ""),
+            "question":     question,
+            "yes_price":    round(yes_price * 100, 1),   # у відсотках
+            "no_price":     round(no_price * 100, 1),
+            "payoff":       round((1 - no_price) / no_price, 1),
+            "volume":       round(volume),
+            "days_left":    round(days_left, 1),
+            "end_date":     end_dt.strftime("%d.%m.%Y"),
+            "rules_risk":   round(rules_risk * 100, 0),
+            "news_risk":    round(news_risk * 100, 0),
+            "rules_flags":  rules_flags,
+            "news_summary": news_summary,
+            "score":        score,
+            "url":          f"https://polymarket.com/event/{market.get('slug', '')}",
+        })
+
+    # Сортуємо за score (вище = цікавіше)
+    candidates.sort(key=lambda x: -x["score"])
+    return candidates
+
+
+def fmt_no_candidate(c: dict, rank: int) -> str:
+    """Форматує один NO кандидат для Telegram."""
+    score_emoji = "🔴" if c["score"] >= 65 else ("🟠" if c["score"] >= 50 else "🟡")
+    flags_str   = "\n   ".join(c["rules_flags"][:3]) if c["rules_flags"] else "—"
+
+    # Рекомендований розмір позиції (консервативно)
+    if c["score"] >= 65:
+        size_rec = "~$50–100 (сильний сигнал)"
+    elif c["score"] >= 50:
+        size_rec = "~$20–50 (помірний сигнал)"
+    else:
+        size_rec = "~$10–20 (слабкий сигнал)"
+
+    return (
+        f"{score_emoji} *#{rank} Score {c['score']:.0f}/100*\n"
+        f"❓ {c['question'][:90]}\n\n"
+        f"💰 YES={c['yes_price']}¢  NO={c['no_price']}¢  Payoff *{c['payoff']:.1f}x*\n"
+        f"📊 Об'єм: ${c['volume']:,}  │  До резолюції: {c['days_left']:.0f}д ({c['end_date']})\n\n"
+        f"⚖️ Rules ризик: *{c['rules_risk']:.0f}%*\n"
+        f"   {flags_str}\n\n"
+        f"📰 News ризик: *{c['news_risk']:.0f}%*  {c['news_summary']}\n\n"
+        f"💡 Позиція: {size_rec}\n"
+        f"🔗 {c['url']}"
+    )
 
 
 def polymarket_consensus(outcomes: dict, forecast_temp: int) -> str:
@@ -1834,7 +2094,7 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     lines = [
-        "🤖 PolyWeather Bot v4.2",
+        "🤖 PolyWeather Bot v4.3",
         f"chat_id: {cid}",
         "",
         "━━━ 🌍 МІСТО ━━━",
@@ -1929,10 +2189,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /portfolio trades — журнал угод",
         "  /portfolio reset — скинути журнал",
         "",
+        "━━━ 🎯 NO HUNTER ━━━",
+        "/no_scan — топ-5 ринків де варто ставити NO",
+        "/no_scan 10 — топ-10",
+        "/no_scan --min 50 — тільки сильні сигнали",
+        "",
+        "Логіка: YES 83-97%, але є ризик NO:",
+        "  rules ризик×40% + news×25% + payoff×25% + час×10%",
+        "  Авто-алерт о 09:30 якщо score >= 50",
+        "",
         "━━━ ⏰ АВТОМАТИКА ━━━",
         "01:00 — авто MOS (Iowa ASOS факт + Previous Runs)",
         "07:30 — ранковий брифінг (Warsaw першим)",
         "09:00 — скан нових ринків (BUY < 38%)",
+        "09:30 — NO Hunter авто-скан (score >= 50)",
         "14:00 — денний звіт",
         "Кожні 2 хв — моніторинг цін позицій",
         "Кожні 30 хв — зміна прогнозу погоди",
@@ -2545,6 +2815,126 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await job_morning_briefing(context)
 
 
+async def cmd_no_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /no_scan — сканує Polymarket і показує ринки де варто ставити NO.
+
+    Використання:
+      /no_scan        — топ-5 кандидатів
+      /no_scan 10     — топ-10
+      /no_scan --min 50  — мінімальний score 50
+    """
+    args = list(context.args or [])
+
+    # Парсимо аргументи
+    top_n   = 5
+    min_score = NO_HUNTER_MIN_SCORE
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--min" and i + 1 < len(args):
+            try:    min_score = float(args[i + 1]); i += 2; continue
+            except: pass
+        try:    top_n = int(args[i])
+        except: pass
+        i += 1
+
+    await update.message.reply_text(
+        f"🔍 *NO Hunter сканує ринки...*\n"
+        f"Фільтр: YES 83–97% │ об'єм >${NO_HUNTER_MIN_VOL:,} │ до {NO_HUNTER_MAX_DAYS}д\n"
+        f"Мін. score: {min_score}",
+        parse_mode="Markdown"
+    )
+
+    try:
+        candidates = scan_no_opportunities(limit=100)
+    except Exception as e:
+        logger.error("NO scan error: %s", e)
+        await update.message.reply_text(f"⚠️ Помилка сканування: {e}")
+        return
+
+    # Додатково фільтруємо по min_score
+    candidates = [c for c in candidates if c["score"] >= min_score]
+
+    if not candidates:
+        await update.message.reply_text(
+            f"📭 Немає кандидатів з score ≥ {min_score}.\n\n"
+            f"Спробуй знизити поріг: `/no_scan --min 25`",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    # Надсилаємо топ-N
+    shown    = candidates[:top_n]
+    total    = len(candidates)
+    header   = (
+        f"🎯 *NO Hunter — знайдено {total} кандидатів*\n"
+        f"_Показую топ {len(shown)} за NO Score_\n\n"
+        f"{'─' * 30}"
+    )
+    await update.message.reply_text(header, parse_mode="Markdown")
+
+    for rank, c in enumerate(shown, 1):
+        try:
+            await update.message.reply_text(
+                fmt_no_candidate(c, rank),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+                reply_markup=main_keyboard() if rank == len(shown) else None
+            )
+        except Exception as e:
+            logger.warning("NO scan send error rank %d: %s", rank, e)
+
+    if total > top_n:
+        await update.message.reply_text(
+            f"_Ще {total - top_n} кандидатів. `/no_scan {top_n + 5}` щоб побачити більше._",
+            parse_mode="Markdown"
+        )
+
+
+async def job_no_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Щоденний NO Hunter о 09:30 Kyiv.
+    Надсилає тільки якщо є кандидати зі score >= 50 (сильні сигнали).
+    """
+    HIGH_SCORE_THRESHOLD = 50
+
+    try:
+        candidates = scan_no_opportunities(limit=100)
+    except Exception as e:
+        logger.error("Auto NO scan error: %s", e)
+        return
+
+    strong = [c for c in candidates if c["score"] >= HIGH_SCORE_THRESHOLD]
+
+    if not strong:
+        logger.info("NO Hunter auto: немає сильних сигналів (score >= %d)", HIGH_SCORE_THRESHOLD)
+        return
+
+    header = (
+        f"🎯 *NO Hunter — {len(strong)} сильних сигналів*\n"
+        f"_Auto scan 09:30 Kyiv_\n\n"
+        f"{'─' * 30}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=header,
+            parse_mode="Markdown"
+        )
+        for rank, c in enumerate(strong[:3], 1):  # авто: макс 3 щоб не спамити
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=fmt_no_candidate(c, rank),
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.error("NO Hunter notify error: %s", e)
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  BUTTON HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2878,6 +3268,7 @@ def main() -> None:
         ("buy",       cmd_buy),       ("sell",     cmd_sell),
         ("positions", cmd_positions), ("history",  cmd_history),
         ("actual",    cmd_actual),    ("briefing", cmd_briefing),
+        ("no_scan",   cmd_no_scan),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 
@@ -2895,6 +3286,8 @@ def main() -> None:
     jq.run_daily(job_morning_briefing, time=kyiv_730.timetz(), name="briefing_730")
     jq.run_daily(job_market_scan,      time=kyiv_9.timetz(),   name="market_scan_9")
     jq.run_daily(job_daily_14,         time=kyiv_14.timetz(),  name="daily_14")
+    kyiv_930 = datetime.now(KYIV_TZ).replace(hour=9, minute=30, second=0, microsecond=0)
+    jq.run_daily(job_no_scan,           time=kyiv_930.timetz(), name="no_scan_930")
     jq.run_repeating(monitor_job,          interval=120,        first=15,   name="price_monitor")
     jq.run_repeating(job_forecast_monitor, interval=30*60,      first=60,   name="forecast_monitor")  # кожні 3 год
 
