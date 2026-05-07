@@ -1057,6 +1057,14 @@ def _prefilter_score(c: dict) -> float:
 
     return round(payoff_score + days_score + kw_score, 3)
 
+def _md_escape(text: str) -> str:
+    """Екранує спецсимволи Markdown v1 в довільному тексті."""
+    # Екрануємо тільки символи що не є частиною нашого форматування
+    for ch in ['_', '*', '`', '[']:
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
 
 # ── LLM аналіз (тільки топ-5) ────────────────────────────────────────────────
 
@@ -1374,13 +1382,15 @@ def fmt_no_candidate(c: dict, rank: int) -> str:
     if c.get("news"):
         news_str = "\n📰 Новини:\n" + "\n".join(f"  • {h[:70]}" for h in c["news"])
 
+    q = _md_escape(c['question'][:90])
+    r = _md_escape(c.get('reason', '—'))
     return (
         f"{score_emoji} *#{rank} NO Score {c['score']:.0f}*\n"
-        f"❓ {c['question'][:90]}\n\n"
+        f"❓ {q}\n\n"
         f"💰 YES={c['yes_price']}¢  NO={c['no_price']}¢  Payoff *{c['payoff']:.1f}x*\n"
         f"📊 Об'єм: ${c['volume']:,}  │  {c['days_left']:.0f}д ({c['end_date']})\n\n"
         f"🧠 LLM P(NO): *{c['no_prob_llm']}%*  (ринок: {c['no_price']}%)\n"
-        f"💡 {c['reason']}"
+        f"💡 {r}"
         f"{news_str}\n\n"
         f"📍 Позиція: {size_rec}\n"
         f"🔗 {c['url']}"
@@ -1399,14 +1409,16 @@ def fmt_edge_candidate(c: dict, rank: int) -> str:
     if c.get("news"):
         news_str = "\n📰 Новини:\n" + "\n".join(f"  • {h[:70]}" for h in c["news"])
 
+    q2 = _md_escape(c['question'][:90])
+    r2 = _md_escape(c.get('reason', '—'))
     return (
         f"💎 *#{rank} Edge {c['score']:.0f} | впевненість {c['confidence']}%*\n"
-        f"❓ {c['question'][:90]}\n\n"
+        f"❓ {q2}\n\n"
         f"💰 YES={c['yes_price']}¢  NO={c['no_price']}¢\n"
         f"📊 Об'єм: ${c['volume']:,}  │  {c['days_left']:.0f}д ({c['end_date']})\n\n"
         f"🎯 LLM: реальна ймов. YES = *{c['true_prob']}%*  (ринок: {c['yes_price']}%)\n"
         f"📉 Помилка ринку: *{c['edge_pct']:+.0f}%*\n"
-        f"💡 {c['reason']}"
+        f"💡 {r2}"
         f"{news_str}\n\n"
         f"{action}\n"
         f"🔗 {c['url']}"
