@@ -6,7 +6,7 @@ London EGLC Temperature Polymarket Bot v4
   1. 3 найточніші моделі для Лондона (Open-Meteo, без ключів):
        ECMWF IFS      /v1/forecast (ECMWF best-match, 9 км)
        DWD ICON       /v1/dwd-icon                      (2 км, найкращий для Європи)
-       UK Met Office  /v1/ukmo                          (2 км, офіційний британський)
+       UK Met Office  /v1/forecast?models=ukmo_seamless (офіційний британський)
      + Погодинний max: беремо hourly і рахуємо max самі (точніше ніж daily)
      + Поправка на хмарність (☀️+0.5°C / ☁️-0.3°C) та вітер (💨 до -0.6°C)
 
@@ -405,9 +405,9 @@ def fetch_dwd_icon(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, t
 def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
     """
     UK Met Office via Open-Meteo.
-    Правильний endpoint: https://api.open-meteo.com/v1/ukmo
-    Моделі: ukmo_global_deterministic_10km (глобальна) + ukmo_uk_deterministic_2km (2km UK/Ireland).
-    Примітка: UK 2km доступна тільки для UK/Ireland, тому для Munich fallback на global.
+    Endpoint (оновлено 05.2026): /v1/forecast?models=ukmo_seamless
+    /v1/ukmo більше не існує — повертає 404.
+    Для UK координат пробуємо ukmo_seamless, fallback на ukmo_global_deterministic_10km.
     """
     ds = dt.strftime("%Y-%m-%d")
 
@@ -415,10 +415,18 @@ def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: 
     # Для інших країн — відразу global
     uk_bounds = (49.5 <= lat <= 61.0 and -8.5 <= lon <= 2.0)
 
+    # Open-Meteo перемістили UK Met Office в /v1/forecast з параметром models=
+    # /v1/ukmo більше не існує (404 з травня 2026)
     urls_to_try = []
     if uk_bounds:
-        urls_to_try.append(("https://api.open-meteo.com/v1/ukmo", {"models": "ukmo_uk_deterministic_2km"}))
-    urls_to_try.append(("https://api.open-meteo.com/v1/ukmo", {"models": "ukmo_global_deterministic_10km"}))
+        urls_to_try.append((
+            "https://api.open-meteo.com/v1/forecast",
+            {"models": "ukmo_seamless"}
+        ))
+    urls_to_try.append((
+        "https://api.open-meteo.com/v1/forecast",
+        {"models": "ukmo_global_deterministic_10km"}
+    ))
 
     for url, extra_params in urls_to_try:
         params = {
@@ -916,7 +924,7 @@ NO_HUNTER_YES_MAX    = 0.97   # вище — NO занадто дешевий, �
 NO_HUNTER_MIN_VOL    = 10_000 # мінімальний об'єм ринку в USD
 NO_HUNTER_MAX_DAYS   = 20     # максимум днів до резолюції
 NO_HUNTER_MIN_DAYS   = 1      # мінімум
-NO_HUNTER_MIN_SCORE  = 35     # мінімальний NO Score для алерту (0–100)
+NO_HUNTER_MIN_SCORE  = 20     # мінімальний NO Score для алерту (0–100)
 
 # Паттерни в тексті rules що підвищують ризик NO
 _RULES_RISK_PATTERNS = [
@@ -1024,59 +1032,49 @@ def _no_score(yes_price: float, days_left: float,
 def scan_no_opportunities(limit: int = 50) -> list[dict]:
     """
     Головна функція NO Hunter.
-    Сканує активні ринки Polymarket і повертає відсортований список кандидатів.
+    Використовує /events endpoint (як решта бота) — правильна структура:
+    event -> markets[] -> outcomePrices, question
+    endDate і volume на рівні event.
     """
-    import re
     from datetime import timezone as _tz
 
-    # Тягнемо активні ринки з Gamma API
+    # Тягнемо активні events з Gamma API (той самий endpoint що використовує бот)
     data = _safe_get(
-        "https://gamma-api.polymarket.com/markets",
+        "https://gamma-api.polymarket.com/events",
         params={
-            "active":   "true",
-            "closed":   "false",
-            "limit":    limit,
-            "order":    "volume24hr",
-            "ascending":"false",
+            "active":    "true",
+            "closed":    "false",
+            "limit":     limit,
+            "order":     "volume24hr",
+            "ascending": "false",
         }
     )
     if not data or not isinstance(data, list):
-        logger.error("NO Hunter: Gamma API повернув порожній результат")
+        logger.error("NO Hunter: Gamma /events повернув порожній результат")
         return []
 
     candidates = []
     now_dt     = datetime.utcnow().replace(tzinfo=_tz.utc)
 
-    for market in data:
-        # ── Базові поля ──
-        question   = market.get("question", "")
-        end_date_s = market.get("endDate") or market.get("endDateIso") or ""
-        volume     = float(market.get("volume", 0) or 0)
-        prices_raw = market.get("outcomePrices", "[]")
+    for event in data:
+        markets    = event.get("markets", [])
+        end_date_s = event.get("endDate") or event.get("endDateIso") or ""
+        volume     = float(event.get("volume", 0) or 0)
+        slug       = event.get("slug", "")
+        title      = event.get("title", "")
 
-        if isinstance(prices_raw, str):
-            try:    prices = json.loads(prices_raw)
-            except: prices = []
-        else:
-            prices = prices_raw or []
-
-        # Беремо YES ціну (перший outcome = YES)
-        try:    yes_price = float(prices[0])
-        except: continue
-
-        # ── Фільтр 1: ціна YES в діапазоні ──
-        if not (NO_HUNTER_YES_MIN <= yes_price <= NO_HUNTER_YES_MAX):
-            continue
-
-        # ── Фільтр 2: об'єм ──
+        # ── Фільтр: об'єм ──
         if volume < NO_HUNTER_MIN_VOL:
             continue
 
-        # ── Фільтр 3: кількість днів до резолюції ──
+        # ── Фільтр: дата ──
+        if not end_date_s:
+            # Беремо з першого market якщо нема на рівні event
+            if markets:
+                end_date_s = markets[0].get("endDate", "")
         if not end_date_s:
             continue
         try:
-            # Polymarket повертає ISO формат
             end_dt = datetime.fromisoformat(end_date_s.replace("Z", "+00:00"))
             if end_dt.tzinfo is None:
                 end_dt = end_dt.replace(tzinfo=_tz.utc)
@@ -1087,36 +1085,55 @@ def scan_no_opportunities(limit: int = 50) -> list[dict]:
         if not (NO_HUNTER_MIN_DAYS <= days_left <= NO_HUNTER_MAX_DAYS):
             continue
 
-        # ── Аналіз rules ──
-        rules_text  = market.get("description", "") or ""
-        rules_risk, rules_flags = _rules_risk_score(rules_text)
+        # ── Аналізуємо кожен market в event ──
+        for market in markets:
+            question   = market.get("question", title).strip()
+            prices_raw = market.get("outcomePrices", "[]")
 
-        # ── Новинний ризик (по заголовку) ──
-        news_risk, news_summary = _web_search_risk(question)
+            if isinstance(prices_raw, str):
+                try:    prices = json.loads(prices_raw)
+                except: prices = []
+            else:
+                prices = prices_raw or []
 
-        # ── Фінальний score ──
-        score = _no_score(yes_price, days_left, rules_risk, news_risk)
+            # YES ціна = перший outcome
+            try:    yes_price = float(prices[0])
+            except: continue
 
-        if score < NO_HUNTER_MIN_SCORE:
-            continue
+            # ── Фільтр: ціна YES в діапазоні ──
+            if not (NO_HUNTER_YES_MIN <= yes_price <= NO_HUNTER_YES_MAX):
+                continue
 
-        no_price = round(1.0 - yes_price, 3)
-        candidates.append({
-            "market_id":    market.get("id", ""),
-            "question":     question,
-            "yes_price":    round(yes_price * 100, 1),   # у відсотках
-            "no_price":     round(no_price * 100, 1),
-            "payoff":       round((1 - no_price) / no_price, 1),
-            "volume":       round(volume),
-            "days_left":    round(days_left, 1),
-            "end_date":     end_dt.strftime("%d.%m.%Y"),
-            "rules_risk":   round(rules_risk * 100, 0),
-            "news_risk":    round(news_risk * 100, 0),
-            "rules_flags":  rules_flags,
-            "news_summary": news_summary,
-            "score":        score,
-            "url":          f"https://polymarket.com/event/{market.get('slug', '')}",
-        })
+            # ── Аналіз rules ──
+            rules_text           = market.get("description", "") or event.get("description", "") or ""
+            rules_risk, rules_flags = _rules_risk_score(rules_text)
+
+            # ── Новинний ризик (по заголовку) ──
+            news_risk, news_summary = _web_search_risk(question)
+
+            # ── Фінальний score ──
+            score = _no_score(yes_price, days_left, rules_risk, news_risk)
+
+            if score < NO_HUNTER_MIN_SCORE:
+                continue
+
+            no_price = round(1.0 - yes_price, 3)
+            candidates.append({
+                "market_id":    market.get("id", ""),
+                "question":     question,
+                "yes_price":    round(yes_price * 100, 1),
+                "no_price":     round(no_price * 100, 1),
+                "payoff":       round((1 - no_price) / no_price, 1) if no_price > 0 else 0,
+                "volume":       round(volume),
+                "days_left":    round(days_left, 1),
+                "end_date":     end_dt.strftime("%d.%m.%Y"),
+                "rules_risk":   round(rules_risk * 100),
+                "news_risk":    round(news_risk * 100),
+                "rules_flags":  rules_flags,
+                "news_summary": news_summary,
+                "score":        score,
+                "url":          f"https://polymarket.com/event/{slug}",
+            })
 
     # Сортуємо за score (вище = цікавіше)
     candidates.sort(key=lambda x: -x["score"])
