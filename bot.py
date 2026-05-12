@@ -1786,44 +1786,91 @@ async def scan_global_markets(
     ]
 
     def _fetch_events() -> list[dict]:
-        """Синхронно тягне всі температурні ринки."""
+        """
+        Тягне температурні ринки через Gamma API.
+        Правильний підхід: використовуємо slug_url параметр для пошуку по slug.
+        Gamma API підтримує пошук по частині slug через параметр 'slugUrl'.
+        """
         all_events = []
-        # Пробуємо кілька варіантів запиту — Gamma API може не підтримувати tag_slug
-        attempts = [
-            # Спроба 1: з tag_slug
-            {"active": "true", "closed": "false", "tag_slug": "temperature",
-             "limit": 100, "offset": 0, "order": "volume24hr", "ascending": "false"},
-            # Спроба 2: пошук по title
-            {"active": "true", "closed": "false", "tag": "Daily Temperature",
-             "limit": 100, "offset": 0, "order": "volume24hr", "ascending": "false"},
-            # Спроба 3: без фільтру тегу — всі активні
-            {"active": "true", "closed": "false",
-             "limit": 100, "offset": 0, "order": "volume24hr", "ascending": "false"},
-        ]
-        for params in attempts:
+
+        # Метод 1: шукаємо по slug prefix — найнадійніший
+        for prefix in ["highest-temperature-in-", "lowest-temperature-in-"]:
             offset = 0
-            batch  = []
             while True:
-                params["offset"] = offset
-                data = _safe_get("https://gamma-api.polymarket.com/events", params=params)
+                data = _safe_get(
+                    "https://gamma-api.polymarket.com/events",
+                    params={
+                        "active":      "true",
+                        "closed":      "false",
+                        "slug_url":    prefix,
+                        "limit":       100,
+                        "offset":      offset,
+                        "order":       "volume24hr",
+                        "ascending":   "false",
+                    }
+                )
                 if not data or not isinstance(data, list) or not data:
                     break
-                # Фільтруємо тільки temperature ринки
-                temp_events = [
-                    e for e in data
-                    if "temperature-in-" in e.get("slug", "")
-                ]
-                batch.extend(temp_events)
+                temp = [e for e in data if prefix in e.get("slug", "")]
+                all_events.extend(temp)
+                logger.info("Global scan slug=%s offset=%d got %d events", prefix, offset, len(temp))
                 if len(data) < 100:
                     break
                 offset += 100
-                if offset > 500:  # safety limit
+                if offset > 1000:
                     break
-            if batch:
-                all_events = batch
-                logger.info("Global scan: fetched %d temp events (attempt params=%s)",
-                            len(batch), list(params.keys())[:2])
-                break
+
+        if all_events:
+            logger.info("Global scan method1: %d events", len(all_events))
+            return all_events
+
+        # Метод 2: tag_slug (може не працювати але пробуємо)
+        for tag in ["temperature", "weather"]:
+            data = _safe_get(
+                "https://gamma-api.polymarket.com/events",
+                params={
+                    "active":    "true",
+                    "closed":    "false",
+                    "tag_slug":  tag,
+                    "limit":     100,
+                    "order":     "volume24hr",
+                    "ascending": "false",
+                }
+            )
+            if data and isinstance(data, list):
+                temp = [e for e in data if "temperature-in-" in e.get("slug", "")]
+                if temp:
+                    all_events.extend(temp)
+                    logger.info("Global scan tag=%s: %d events", tag, len(temp))
+                    break
+
+        if all_events:
+            return all_events
+
+        # Метод 3: напряму по відомих містах через slug
+        known_slugs_cities = [
+            "hong-kong", "london", "warsaw", "munich", "paris",
+            "seoul", "shanghai", "tokyo", "new-york", "berlin",
+            "singapore", "dubai", "istanbul", "amsterdam",
+        ]
+        from datetime import timedelta as _td
+        now_dt = datetime.utcnow()
+        for days_ahead in [1, 2]:
+            dt = now_dt + _td(days=days_ahead)
+            date_str = f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
+            for city in known_slugs_cities:
+                for mtype in ["highest", "lowest"]:
+                    slug = f"{mtype}-temperature-in-{city}-on-{date_str}"
+                    data = _safe_get(
+                        "https://gamma-api.polymarket.com/events",
+                        params={"slug": slug}
+                    )
+                    if data and isinstance(data, list) and data:
+                        event = data[0]
+                        if event.get("markets") and float(event.get("volume24hr") or 0) > 100:
+                            all_events.append(event)
+
+        logger.info("Global scan method3 (direct slugs): %d events", len(all_events))
         return all_events
 
     def _get_forecast(city_slug: str, dt: datetime, market_type: str) -> dict | None:
@@ -3361,7 +3408,10 @@ def main() -> None:
 
     start_keep_alive()
     logger.info("Bot v4 | 07:30 briefing | 09:00 scan | 14:00 daily | price 2min | forecast 30min")
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True,   # скидаємо старі updates при старті
+        allowed_updates=["message", "callback_query"],  # тільки потрібні типи
+    )
 
 
 if __name__ == "__main__":
