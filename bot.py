@@ -1153,7 +1153,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("🌡️ Макс"),          KeyboardButton("❄️ Мін")],
         [KeyboardButton("📅 Сьогодні"),      KeyboardButton("🔍 Завтра"),  KeyboardButton("📅 Після завтра")],
         [KeyboardButton("📊 Polymarket"),    KeyboardButton("📈 Позиції"), KeyboardButton("📉 Тренд")],
-        [KeyboardButton("📋 Брифінг"),       KeyboardButton("❓ Допомога")],
+        [KeyboardButton("🔎 Глобальний скан"), KeyboardButton("📋 Брифінг"), KeyboardButton("❓ Допомога")],
     ], resize_keyboard=True)
 
 
@@ -1558,6 +1558,373 @@ async def job_auto_mos(context) -> None:
         except Exception as e:
             logger.error("Auto MOS notify: %s", e)
 
+
+
+# ══════════════════════════════════════════════════════
+# GLOBAL WEATHER MARKET SCANNER
+# Знаходить недооцінені ринки по всьому світу
+# Аналізує і YES (BUY) і NO (FADE) можливості
+# ══════════════════════════════════════════════════════
+
+# Відомі міста: координати airport station + timezone
+KNOWN_CITIES: dict = {
+    # Європа
+    "london":      {"lat": 51.5048, "lon": 0.0495,   "tz": "Europe/London",      "station": "EGLC"},
+    "warsaw":      {"lat": 52.1657, "lon": 20.9671,   "tz": "Europe/Warsaw",      "station": "EPWA"},
+    "munich":      {"lat": 48.3537, "lon": 11.7750,   "tz": "Europe/Berlin",      "station": "EDDM"},
+    "paris":       {"lat": 48.9694, "lon": 2.4414,    "tz": "Europe/Paris",       "station": "LFPB"},
+    "berlin":      {"lat": 52.3667, "lon": 13.5033,   "tz": "Europe/Berlin",      "station": "EDDB"},
+    "amsterdam":   {"lat": 52.3086, "lon": 4.7639,    "tz": "Europe/Amsterdam",   "station": "EHAM"},
+    "madrid":      {"lat": 40.4719, "lon": -3.5626,   "tz": "Europe/Madrid",      "station": "LEMD"},
+    "rome":        {"lat": 41.8003, "lon": 12.2389,   "tz": "Europe/Rome",        "station": "LIRF"},
+    "istanbul":    {"lat": 41.2753, "lon": 28.7519,   "tz": "Europe/Istanbul",    "station": "LTFM"},
+    # Азія
+    "hong-kong":   {"lat": 22.3080, "lon": 113.9185,  "tz": "Asia/Hong_Kong",     "station": "VHHH"},
+    "seoul":       {"lat": 37.4602, "lon": 126.4407,  "tz": "Asia/Seoul",         "station": "RKSI"},
+    "shanghai":    {"lat": 31.1443, "lon": 121.8083,  "tz": "Asia/Shanghai",      "station": "ZSPD"},
+    "tokyo":       {"lat": 35.5494, "lon": 139.7798,  "tz": "Asia/Tokyo",         "station": "RJTT"},
+    "singapore":   {"lat": 1.3644,  "lon": 103.9915,  "tz": "Asia/Singapore",     "station": "WSSS"},
+    "dubai":       {"lat": 25.2532, "lon": 55.3657,   "tz": "Asia/Dubai",         "station": "OMDB"},
+    "beijing":     {"lat": 40.0799, "lon": 116.6031,  "tz": "Asia/Shanghai",      "station": "ZBAA"},
+    "bangkok":     {"lat": 13.6811, "lon": 100.7470,  "tz": "Asia/Bangkok",       "station": "VTBS"},
+    # Америка
+    "new-york":    {"lat": 40.7769, "lon": -73.8740,  "tz": "America/New_York",   "station": "KLGA"},
+    "miami":       {"lat": 25.7959, "lon": -80.2870,  "tz": "America/New_York",   "station": "KMIA"},
+    "chicago":     {"lat": 41.9742, "lon": -87.9073,  "tz": "America/Chicago",    "station": "KORD"},
+    "los-angeles": {"lat": 33.9425, "lon": -118.4081, "tz": "America/Los_Angeles","station": "KLAX"},
+    "toronto":     {"lat": 43.6777, "lon": -79.6248,  "tz": "America/Toronto",    "station": "CYYZ"},
+    "sao-paulo":   {"lat": -23.4356,"lon": -46.4731,  "tz": "America/Sao_Paulo",  "station": "SBGR"},
+    # Австралія
+    "sydney":      {"lat": -33.9399,"lon": 151.1753,  "tz": "Australia/Sydney",   "station": "YSSY"},
+    "melbourne":   {"lat": -37.6690,"lon": 144.8410,  "tz": "Australia/Melbourne","station": "YMML"},
+}
+
+# UTC offset (влітку)
+TZ_UTC_OFFSET = {
+    "Europe/London": 1, "Europe/Warsaw": 2, "Europe/Berlin": 2, "Europe/Paris": 2,
+    "Europe/Amsterdam": 2, "Europe/Madrid": 2, "Europe/Rome": 2, "Europe/Istanbul": 3,
+    "Asia/Hong_Kong": 8, "Asia/Seoul": 9, "Asia/Shanghai": 8, "Asia/Tokyo": 9,
+    "Asia/Singapore": 8, "Asia/Dubai": 4, "Asia/Bangkok": 7,
+    "America/New_York": -4, "America/Chicago": -5, "America/Los_Angeles": -7,
+    "America/Toronto": -4, "America/Sao_Paulo": -3,
+    "Australia/Sydney": 10, "Australia/Melbourne": 10,
+}
+
+MIN_EDGE_PCT   = 8.0   # мінімальний edge % для сигналу
+MIN_VOLUME_USD = 300   # мінімальний обсяг ринку
+NO_EDGE_PCT    = 10.0  # мінімальний edge для NO trades (трохи вищий)
+
+
+def _parse_city_from_slug(slug: str) -> str | None:
+    import re
+    m = re.match(r"(?:highest|lowest)-temperature-in-(.+?)-on-", slug)
+    return m.group(1) if m else None
+
+
+def _parse_market_type_from_slug(slug: str) -> str:
+    return "lowest" if slug.startswith("lowest") else "highest"
+
+
+def _parse_date_from_slug(slug: str) -> datetime | None:
+    """Витягує дату з slug: highest-temperature-in-london-on-may-11-2026"""
+    import re
+    m = re.search(r"-on-(\w+)-(\d+)-(\d{4})$", slug)
+    if not m: return None
+    months = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+              "july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
+    month_name, day, year = m.group(1).lower(), int(m.group(2)), int(m.group(3))
+    month = months.get(month_name)
+    if not month: return None
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def get_forecast_for_unknown_city(city_slug: str, dt: datetime, market_type: str) -> dict | None:
+    """
+    Отримує прогноз для міста з KNOWN_CITIES по координатах airport station.
+    Якщо міста немає в KNOWN_CITIES — пропускаємо.
+    """
+    cfg = KNOWN_CITIES.get(city_slug)
+    if not cfg:
+        return None
+
+    lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
+    ds = dt.strftime("%Y-%m-%d")
+
+    # Отримуємо прогноз з ECMWF + DWD ICON (швидко, без ensemble для сканування)
+    temps = []
+    for url, params in [
+        ("https://api.open-meteo.com/v1/forecast", {
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m",
+            "timezone": tz, "start_date": ds, "end_date": ds,
+        }),
+        ("https://api.open-meteo.com/v1/dwd-icon", {
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m",
+            "timezone": tz, "start_date": ds, "end_date": ds,
+        }),
+    ]:
+        data = _safe_get(url, params=params)
+        if not data: continue
+        hourly = data.get("hourly", {})
+        times  = hourly.get("time", [])
+        vals   = hourly.get("temperature_2m", [])
+        day_temps = [
+            float(vals[i]) for i, t in enumerate(times)
+            if t.startswith(ds) and i < len(vals) and vals[i] is not None
+        ]
+        if day_temps:
+            val = min(day_temps) if market_type == "lowest" else max(day_temps)
+            temps.append(val)
+
+    if not temps:
+        return None
+
+    forecast_mean = round(sum(temps) / len(temps), 1)
+    return {
+        "mean":       forecast_mean,
+        "final_int":  round(forecast_mean),
+        "sources":    len(temps),
+        "station":    cfg["station"],
+        "tz":         cfg["tz"],
+    }
+
+
+def analyze_market_edge(
+    outcomes: dict,
+    forecast_mean: float,
+    forecast_int: int,
+    market_type: str,
+) -> list[dict]:
+    """
+    Аналізує кожен outcome на предмет edge.
+    Повертає список сигналів (YES BUY і NO FADE).
+
+    YES BUY: модель каже X°C, ринок оцінює X°C дешево (< 38%)
+    NO FADE: модель каже X°C неможливий, але ринок дає > NO_EDGE_PCT%
+
+    Формула edge:
+      yes_edge = model_prob - market_price  (позитивний = BUY YES)
+      no_edge  = market_price - model_prob  (позитивний = BUY NO)
+    """
+    import math
+
+    def normal_cdf(x, mu, sigma):
+        if sigma <= 0: return 1.0 if x >= mu else 0.0
+        z = (x - mu) / sigma
+        t = 1.0 / (1.0 + 0.2316419 * abs(z))
+        poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 +
+               t * (-1.821255978 + t * 1.330274429))))
+        cdf  = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * z * z) * poly
+        return cdf if z >= 0 else 1.0 - cdf
+
+    sigma = 1.2  # типове std для 1-2 денного прогнозу
+    signals = []
+
+    for lbl, market_pct in outcomes.items():
+        import re as _re
+        m = _re.search(r"(\d+)", lbl)
+        if not m: continue
+        t_val = int(m.group(1))
+
+        # Модельна ймовірність для цього бакету
+        model_prob = round((normal_cdf(t_val + 0.5, forecast_mean, sigma) -
+                            normal_cdf(t_val - 0.5, forecast_mean, sigma)) * 100, 1)
+
+        yes_edge = round(model_prob - market_pct, 1)  # + = YES дешево
+        no_edge  = round(market_pct - model_prob, 1)  # + = NO дешево
+
+        # YES BUY сигнал
+        if yes_edge >= MIN_EDGE_PCT and market_pct < 80:
+            signals.append({
+                "type":        "YES",
+                "label":       lbl,
+                "market_pct":  market_pct,
+                "model_prob":  model_prob,
+                "edge":        yes_edge,
+                "signal":      "BUY YES",
+                "emoji":       "🟢",
+                "action":      f"Купи YES {lbl} @ {market_pct}%",
+            })
+
+        # NO FADE сигнал: ринок переоцінює outcome який модель вважає малоймовірним
+        # Приклад: Warsaw "15°C or higher" @ 65% але прогноз каже 8°C → NO @ 35%
+        # Купуємо NO = ставимо що це НЕ відбудеться
+        if no_edge >= NO_EDGE_PCT and market_pct > 15 and model_prob < 30:
+            no_price = round(100 - market_pct, 1)  # ціна NO = 100 - YES
+            signals.append({
+                "type":        "NO",
+                "label":       lbl,
+                "market_pct":  market_pct,  # ціна YES
+                "no_price":    no_price,    # ціна NO (що ми купуємо)
+                "model_prob":  model_prob,
+                "edge":        no_edge,
+                "signal":      "BUY NO",
+                "emoji":       "🔵",
+                "action":      f"Купи NO {lbl} @ {no_price}% (YES={market_pct}%)",
+            })
+
+    # Сортуємо по edge (спадний)
+    signals.sort(key=lambda x: -x["edge"])
+    return signals
+
+
+async def scan_global_markets(
+    days: list[int] = [1, 2],
+    min_volume: int = MIN_VOLUME_USD,
+    chat_id: str | None = None,
+    bot=None,
+) -> list[dict]:
+    """
+    Головна функція: тягне всі активні температурні ринки,
+    фільтрує по обсягу і горизонту, рахує edge, повертає топ сигнали.
+    Аналізує і YES BUY і NO FADE можливості.
+    """
+    now    = datetime.utcnow()
+    target_dates = [
+        (now + timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
+        for d in days
+    ]
+
+    all_signals = []
+    processed   = 0
+    errors      = 0
+
+    # Тягнемо всі температурні ринки через Gamma API
+    offset = 0
+    all_events = []
+    while True:
+        data = _safe_get(
+            "https://gamma-api.polymarket.com/events",
+            params={
+                "active":     "true",
+                "closed":     "false",
+                "tag_slug":   "temperature",
+                "limit":      100,
+                "offset":     offset,
+                "order":      "volume24hr",
+                "ascending":  "false",
+            }
+        )
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+        all_events.extend(data)
+        if len(data) < 100:
+            break
+        offset += 100
+
+    logger.info("Global scan: %d events fetched", len(all_events))
+
+    for event in all_events:
+        slug       = event.get("slug", "")
+        volume24hr = float(event.get("volume24hr") or 0)
+        markets    = event.get("markets", [])
+
+        if not markets: continue
+        if volume24hr < min_volume: continue
+        if "temperature-in-" not in slug: continue
+
+        city_slug   = _parse_city_from_slug(slug)
+        market_type = _parse_market_type_from_slug(slug)
+        market_date = _parse_date_from_slug(slug)
+
+        if not city_slug or not market_date: continue
+
+        # Фільтр по горизонту — тільки наші target dates
+        if market_date.date() not in [d.date() for d in target_dates]:
+            continue
+
+        # Перевіряємо чи маємо координати
+        cfg = KNOWN_CITIES.get(city_slug)
+        if not cfg:
+            logger.debug("Unknown city: %s", city_slug)
+            continue
+
+        # Отримуємо прогноз погоди
+        fc = get_forecast_for_unknown_city(city_slug, market_date, market_type)
+        if not fc:
+            errors += 1
+            continue
+
+        processed += 1
+
+        # Парсимо поточні ціни ринку
+        outcomes = parse_all_outcomes(markets)
+        if not outcomes: continue
+
+        # Аналізуємо edge (YES і NO)
+        signals = analyze_market_edge(
+            outcomes, fc["mean"], fc["final_int"], market_type
+        )
+        if not signals: continue
+
+        link = f"https://polymarket.com/event/{slug}"
+
+        for sig in signals:
+            all_signals.append({
+                **sig,
+                "city":        city_slug,
+                "station":     cfg["station"],
+                "market_type": market_type,
+                "date":        market_date,
+                "volume24hr":  volume24hr,
+                "forecast":    fc["mean"],
+                "link":        link,
+            })
+
+    logger.info("Global scan: %d cities processed, %d errors, %d signals",
+                processed, errors, len(all_signals))
+
+    # Сортуємо: спочатку найбільший edge, потім найбільший обсяг
+    all_signals.sort(key=lambda x: (-x["edge"], -x["volume24hr"]))
+    return all_signals
+
+
+def format_global_scan_results(signals: list[dict], max_results: int = 10) -> str:
+    if not signals:
+        return "Недооцінених ринків не знайдено. Всі ринки справедливо оцінені."
+
+    yes_signals = [s for s in signals if s["type"] == "YES"]
+    no_signals  = [s for s in signals if s["type"] == "NO"]
+
+    parts = [f"Global scan: {len(signals)} signals\n"]
+
+    if yes_signals:
+        parts.append("YES BUY:")
+        for s in yes_signals[:5]:
+            tz_offset = TZ_UTC_OFFSET.get(KNOWN_CITIES.get(s["city"], {}).get("tz", "UTC"), 0)
+            mtype = "Max" if s["market_type"] == "highest" else "Min"
+            parts.append(
+                f"  YES {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
+                f" [{s['station']} UTC{tz_offset:+d}]"
+                f" {s['label']}@{s['market_pct']}% forecast:{s['forecast']:.1f}C"
+                f" edge:+{s['edge']:.1f}% vol:${s['volume24hr']:,.0f}"
+                f" {s['link']}"
+            )
+
+    if no_signals:
+        parts.append("\nNO FADE:")
+        for s in no_signals[:5]:
+            tz_offset = TZ_UTC_OFFSET.get(KNOWN_CITIES.get(s["city"], {}).get("tz", "UTC"), 0)
+            mtype = "Max" if s["market_type"] == "highest" else "Min"
+            no_price = s.get("no_price", round(100 - s["market_pct"], 1))
+            parts.append(
+                f"  NO {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
+                f" [{s['station']} UTC{tz_offset:+d}]"
+                f" {s['label']} YES={s['market_pct']}% NO@{no_price}%"
+                f" forecast:{s['forecast']:.1f}C"
+                f" edge:+{s['edge']:.1f}% vol:${s['volume24hr']:,.0f}"
+                f" {s['link']}"
+            )
+
+    parts.append(f"\nMin edge: YES>={MIN_EDGE_PCT}% NO>={NO_EDGE_PCT}%")
+    return "\n".join(parts)
+
+
+
 async def _send_full_report(bot: Bot, dt: datetime,
                              chat_id: str | int, label: str = "🔍",
                              city: str = "london",
@@ -1831,6 +2198,70 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/portfolio trades — останні угоди\n"
             "/portfolio reset — скинути журнал")
 
+
+async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальний пошук недооцінених погодних ринків (YES i NO)."""
+    cid = update.effective_chat.id
+    await context.bot.send_message(chat_id=cid, text="Сканую 25+ міст (~60 сек)...")
+    try:
+        signals = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
+        yes_sigs = [s for s in signals if s["type"] == "YES"]
+        no_sigs  = [s for s in signals if s["type"] == "NO"]
+        lines = [f"SCAN: {len(signals)} signals ({len(yes_sigs)} YES, {len(no_sigs)} NO)"]
+
+        if yes_sigs:
+            lines.append("\nYES BUY (недооцінені):")
+            for s in yes_sigs[:5]:
+                cfg = KNOWN_CITIES.get(s["city"], {})
+                utc = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
+                mtype = "Max" if s["market_type"] == "highest" else "Min"
+                no_p = s.get("no_price", round(100 - s["market_pct"], 1))
+                lines.append(
+                    f"  {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
+                    f" [{s['station']} UTC{utc:+d}]"
+                )
+                lines.append(
+                    f"  {s['label']}@{s['market_pct']}%"
+                    f" prog:{s['forecast']:.1f}C edge:+{s['edge']:.1f}%"
+                    f" vol:${s['volume24hr']:,.0f}"
+                )
+                lines.append(f"  {s['link']}")
+
+        if no_sigs:
+            lines.append("\nNO FADE (переоцінені):")
+            for s in no_sigs[:5]:
+                cfg = KNOWN_CITIES.get(s["city"], {})
+                utc = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
+                mtype = "Max" if s["market_type"] == "highest" else "Min"
+                no_p = s.get("no_price", round(100 - s["market_pct"], 1))
+                lines.append(
+                    f"  {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
+                    f" [{s['station']} UTC{utc:+d}]"
+                )
+                lines.append(
+                    f"  {s['label']} YES={s['market_pct']}% NO@{no_p}%"
+                    f" prog:{s['forecast']:.1f}C edge:+{s['edge']:.1f}%"
+                    f" vol:${s['volume24hr']:,.0f}"
+                )
+                lines.append(f"  {s['link']}")
+
+        if not signals:
+            lines.append("Недооцінених ринків не знайдено.")
+
+        await context.bot.send_message(
+            chat_id=cid,
+            text="\n".join(lines),
+            reply_markup=main_keyboard(),
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error("scan_global: %s", e)
+        await context.bot.send_message(
+            chat_id=cid, text=f"Помилка: {e}", reply_markup=main_keyboard()
+        )
+
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     lines = [
@@ -1848,6 +2279,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  🌡️ Макс — Highest temperature (денний максимум)",
         "  ❄️ Мін  — Lowest temperature (нічний мінімум)",
         "В команді: highest/max або lowest/min",
+        "",
+        "━━━ 🔎 ГЛОБАЛЬНИЙ СКАН ━━━",
+        "Кнопка: Глобальний скан  або  /scan",
+        "Шукає недооцінені ринки у 25+ містах світу.",
+        "Аналізує завтра i пiсля завтра.",
+        "YES BUY: ринок дешевший нiж прогноз (edge >8%).",
+        "NO FADE: ринок переоцiнений, купуй НI (edge >10%).",
         "",
         "━━━ 📊 ПРОГНОЗ ━━━",
         "Кнопки: Сьогодні / Завтра / Після завтра",
@@ -2872,6 +3310,7 @@ def main() -> None:
 
     for cmd, handler in [
         ("portfolio", cmd_portfolio),
+        ("scan",      cmd_scan_global),
         ("start",     cmd_start),     ("check",    cmd_check),
         ("check2",    cmd_check2),    ("poll",     cmd_poll),
         ("forecast",  cmd_forecast),  ("trend",    cmd_trend),
