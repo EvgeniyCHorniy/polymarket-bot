@@ -391,32 +391,27 @@ def fetch_dwd_icon(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, t
 
 def fetch_ukmet(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON, tz: str = "Europe/London", market_type: str = "highest") -> dict | None:
     """
-    UK Met Office via Open-Meteo.
-    Правильний endpoint: https://api.open-meteo.com/v1/ukmo
-    Моделі: ukmo_global_deterministic_10km (глобальна) + ukmo_uk_deterministic_2km (2km UK/Ireland).
-    Примітка: UK 2km доступна тільки для UK/Ireland, тому для Munich fallback на global.
+    UK Met Office через Open-Meteo historical forecast API.
+    /v1/ukmo → 404 (більше не підтримується як окремий endpoint).
+    Використовуємо /v1/forecast з models=ukmo_seamless (якщо доступно)
+    або /v1/gfs як fallback (NOAA GFS — глобальна модель 13km).
     """
     ds = dt.strftime("%Y-%m-%d")
 
-    # Для UK координат — пробуємо 2km модель спочатку
-    # Для інших країн — відразу global
-    uk_bounds = (49.5 <= lat <= 61.0 and -8.5 <= lon <= 2.0)
-
-    urls_to_try = []
-    if uk_bounds:
-        urls_to_try.append(("https://api.open-meteo.com/v1/ukmo", {"models": "ukmo_uk_deterministic_2km"}))
-    urls_to_try.append(("https://api.open-meteo.com/v1/ukmo", {"models": "ukmo_global_deterministic_10km"}))
-
-    for url, extra_params in urls_to_try:
-        params = {
+    # Спробуємо різні варіанти для UK Met Office
+    attempts = [
+        # Варіант 1: GFS через окремий endpoint (завжди доступний)
+        ("https://api.open-meteo.com/v1/gfs", {
             "latitude": lat, "longitude": lon,
             "hourly": "temperature_2m,cloud_cover,windspeed_10m",
             "timezone": tz, "start_date": ds, "end_date": ds,
-            **extra_params,
-        }
+        }),
+    ]
+
+    for url, params in attempts:
         data = _safe_get(url, params=params)
         if data:
-            result = _build_source("UK Met Office", data, ds, market_type)
+            result = _build_source("GFS (NOAA)", data, ds, market_type)
             if result:
                 return result
     return None
@@ -446,18 +441,18 @@ def fetch_ensemble(dt: datetime, lat: float = EGLC_LAT, lon: float = EGLC_LON,
     Тягне GFS Ensemble (31 члени) + ECMWF ENS (51 членів) через Open-Meteo Ensemble API.
     Повертає повний розподіл ймовірностей температури.
 
-    Endpoint: https://api.open-meteo.com/v1/ensemble
-    Models: gfs_seamless (31 members), ecmwf_ifs025 (51 members)
+    Endpoint: https://ensemble-api.open-meteo.com/v1/ensemble
+    Models: gfs_seamless (35 members GFS), icon_seamless (40 members DWD ICON ENS)
     """
     ds = dt.strftime("%Y-%m-%d")
 
     results = {}
     # GFS Ensemble — 31 членів, найкращий для 1-7 днів
     for model_name, model_param, n_members in [
-        ("GFS ENS",   "gfs_seamless",   31),
-        ("ECMWF ENS", "ecmwf_ifs025",   51),
+        ("GFS ENS",  "gfs_seamless",  35),
+        ("ICON ENS", "icon_seamless", 40),
     ]:
-        data = _safe_get("https://api.open-meteo.com/v1/ensemble", params={
+        data = _safe_get("https://ensemble-api.open-meteo.com/v1/ensemble", params={
             "latitude": lat, "longitude": lon,
             "hourly": "temperature_2m",
             "models": model_param,
@@ -537,7 +532,7 @@ def ensemble_probability(ensemble_result: dict | None, target_temp: int,
         return {}
 
     # Агрегуємо всі member temps з усіх моделей (зважено: ECMWF ENS вага 0.55, GFS ENS 0.45)
-    model_weights = {"ECMWF ENS": 0.55, "GFS ENS": 0.45}
+    model_weights = {"ICON ENS": 0.55, "GFS ENS": 0.45}
     all_temps   = []
     total_w     = 0.0
     weighted_mu = 0.0
@@ -690,7 +685,7 @@ def fetch_retrospective_forecast(dt: datetime, city: str = "london") -> dict | N
 SOURCE_WEIGHTS = {
     "ECMWF":        0.30,  # найточніший globally, 9 km
     "DWD ICON":     0.30,  # найкращий для Європи, 2 km
-    "UK Met Office": 0.25, # офіційний UK, 2-10 km
+    "GFS (NOAA)":    0.25, # NOAA GFS 13km, глобальна
     "Meteo-France":  0.15, # Зах. Європа, 1.3-2.5 km
 }
 
@@ -1775,93 +1770,118 @@ def analyze_market_edge(
 async def scan_global_markets(
     days: list[int] = [1, 2],
     min_volume: int = MIN_VOLUME_USD,
-    chat_id: str | None = None,
-    bot=None,
 ) -> list[dict]:
     """
-    Головна функція: тягне всі активні температурні ринки,
-    фільтрує по обсягу і горизонту, рахує edge, повертає топ сигнали.
-    Аналізує і YES BUY і NO FADE можливості.
+    Тягне всі активні температурні ринки через Gamma API.
+    Запускає синхронні HTTP запити в executor щоб не блокувати event loop.
+    Аналізує і YES BUY і NO FADE сигнали.
     """
-    now    = datetime.utcnow()
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    now          = datetime.utcnow()
     target_dates = [
         (now + timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
         for d in days
     ]
 
+    def _fetch_events() -> list[dict]:
+        """Синхронно тягне всі температурні ринки."""
+        all_events = []
+        # Пробуємо кілька варіантів запиту — Gamma API може не підтримувати tag_slug
+        attempts = [
+            # Спроба 1: з tag_slug
+            {"active": "true", "closed": "false", "tag_slug": "temperature",
+             "limit": 100, "offset": 0, "order": "volume24hr", "ascending": "false"},
+            # Спроба 2: пошук по title
+            {"active": "true", "closed": "false", "tag": "Daily Temperature",
+             "limit": 100, "offset": 0, "order": "volume24hr", "ascending": "false"},
+            # Спроба 3: без фільтру тегу — всі активні
+            {"active": "true", "closed": "false",
+             "limit": 100, "offset": 0, "order": "volume24hr", "ascending": "false"},
+        ]
+        for params in attempts:
+            offset = 0
+            batch  = []
+            while True:
+                params["offset"] = offset
+                data = _safe_get("https://gamma-api.polymarket.com/events", params=params)
+                if not data or not isinstance(data, list) or not data:
+                    break
+                # Фільтруємо тільки temperature ринки
+                temp_events = [
+                    e for e in data
+                    if "temperature-in-" in e.get("slug", "")
+                ]
+                batch.extend(temp_events)
+                if len(data) < 100:
+                    break
+                offset += 100
+                if offset > 500:  # safety limit
+                    break
+            if batch:
+                all_events = batch
+                logger.info("Global scan: fetched %d temp events (attempt params=%s)",
+                            len(batch), list(params.keys())[:2])
+                break
+        return all_events
+
+    def _get_forecast(city_slug: str, dt: datetime, market_type: str) -> dict | None:
+        return get_forecast_for_unknown_city(city_slug, dt, market_type)
+
+    # Тягнемо events в executor
+    all_events = await loop.run_in_executor(None, _fetch_events)
+    logger.info("Global scan: %d temp events total", len(all_events))
+
+    if not all_events:
+        logger.warning("Global scan: no events found!")
+        return []
+
     all_signals = []
     processed   = 0
-    errors      = 0
-
-    # Тягнемо всі температурні ринки через Gamma API
-    offset = 0
-    all_events = []
-    while True:
-        data = _safe_get(
-            "https://gamma-api.polymarket.com/events",
-            params={
-                "active":     "true",
-                "closed":     "false",
-                "tag_slug":   "temperature",
-                "limit":      100,
-                "offset":     offset,
-                "order":      "volume24hr",
-                "ascending":  "false",
-            }
-        )
-        if not data or not isinstance(data, list) or len(data) == 0:
-            break
-        all_events.extend(data)
-        if len(data) < 100:
-            break
-        offset += 100
-
-    logger.info("Global scan: %d events fetched", len(all_events))
 
     for event in all_events:
         slug       = event.get("slug", "")
         volume24hr = float(event.get("volume24hr") or 0)
         markets    = event.get("markets", [])
 
-        if not markets: continue
-        if volume24hr < min_volume: continue
-        if "temperature-in-" not in slug: continue
+        if not markets:
+            continue
+        if volume24hr < min_volume:
+            continue
+        if "temperature-in-" not in slug:
+            continue
 
         city_slug   = _parse_city_from_slug(slug)
         market_type = _parse_market_type_from_slug(slug)
         market_date = _parse_date_from_slug(slug)
 
-        if not city_slug or not market_date: continue
+        if not city_slug or not market_date:
+            continue
 
-        # Фільтр по горизонту — тільки наші target dates
+        # Фільтр по горизонту
         if market_date.date() not in [d.date() for d in target_dates]:
             continue
 
-        # Перевіряємо чи маємо координати
         cfg = KNOWN_CITIES.get(city_slug)
         if not cfg:
-            logger.debug("Unknown city: %s", city_slug)
+            logger.debug("Unknown city slug: %s", city_slug)
             continue
 
-        # Отримуємо прогноз погоди
-        fc = get_forecast_for_unknown_city(city_slug, market_date, market_type)
+        # Прогноз в executor
+        fc = await loop.run_in_executor(
+            None, _get_forecast, city_slug, market_date, market_type
+        )
         if not fc:
-            errors += 1
             continue
 
         processed += 1
-
-        # Парсимо поточні ціни ринку
         outcomes = parse_all_outcomes(markets)
-        if not outcomes: continue
+        if not outcomes:
+            continue
 
-        # Аналізуємо edge (YES і NO)
-        signals = analyze_market_edge(
-            outcomes, fc["mean"], fc["final_int"], market_type
-        )
-        if not signals: continue
-
-        link = f"https://polymarket.com/event/{slug}"
+        signals = analyze_market_edge(outcomes, fc["mean"], fc["final_int"], market_type)
+        link    = f"https://polymarket.com/event/{slug}"
 
         for sig in signals:
             all_signals.append({
@@ -1875,10 +1895,7 @@ async def scan_global_markets(
                 "link":        link,
             })
 
-    logger.info("Global scan: %d cities processed, %d errors, %d signals",
-                processed, errors, len(all_signals))
-
-    # Сортуємо: спочатку найбільший edge, потім найбільший обсяг
+    logger.info("Global scan done: %d cities, %d signals", processed, len(all_signals))
     all_signals.sort(key=lambda x: (-x["edge"], -x["volume24hr"]))
     return all_signals
 
@@ -2202,51 +2219,54 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Глобальний пошук недооцінених погодних ринків (YES i NO)."""
     cid = update.effective_chat.id
-    await context.bot.send_message(chat_id=cid, text="Сканую 25+ міст (~60 сек)...")
+    msg = await context.bot.send_message(
+        chat_id=cid,
+        text="Сканую глобальні ринки (25+ міст)..."
+    )
     try:
-        signals = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
-        yes_sigs = [s for s in signals if s["type"] == "YES"]
-        no_sigs  = [s for s in signals if s["type"] == "NO"]
-        lines = [f"SCAN: {len(signals)} signals ({len(yes_sigs)} YES, {len(no_sigs)} NO)"]
+        signals    = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
+        yes_sigs   = [s for s in signals if s["type"] == "YES"]
+        no_sigs    = [s for s in signals if s["type"] == "NO"]
+        lines      = [f"Scan: {len(signals)} сигналів ({len(yes_sigs)} YES, {len(no_sigs)} NO)"]
 
         if yes_sigs:
             lines.append("\nYES BUY (недооцінені):")
-            for s in yes_sigs[:5]:
+            for s in yes_sigs[:6]:
                 cfg = KNOWN_CITIES.get(s["city"], {})
                 utc = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
                 mtype = "Max" if s["market_type"] == "highest" else "Min"
-                no_p = s.get("no_price", round(100 - s["market_pct"], 1))
                 lines.append(
                     f"  {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
                     f" [{s['station']} UTC{utc:+d}]"
                 )
                 lines.append(
-                    f"  {s['label']}@{s['market_pct']}%"
-                    f" prog:{s['forecast']:.1f}C edge:+{s['edge']:.1f}%"
-                    f" vol:${s['volume24hr']:,.0f}"
+                    f"  {s['label']} @ {s['market_pct']}%"
+                    f" | прогноз {s['forecast']:.1f}C | edge +{s['edge']:.1f}%"
+                    f" | vol ${s['volume24hr']:,.0f}"
                 )
                 lines.append(f"  {s['link']}")
 
         if no_sigs:
             lines.append("\nNO FADE (переоцінені):")
-            for s in no_sigs[:5]:
-                cfg = KNOWN_CITIES.get(s["city"], {})
-                utc = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
+            for s in no_sigs[:6]:
+                cfg   = KNOWN_CITIES.get(s["city"], {})
+                utc   = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
                 mtype = "Max" if s["market_type"] == "highest" else "Min"
-                no_p = s.get("no_price", round(100 - s["market_pct"], 1))
+                no_p  = s.get("no_price", round(100 - s["market_pct"], 1))
                 lines.append(
                     f"  {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
                     f" [{s['station']} UTC{utc:+d}]"
                 )
                 lines.append(
-                    f"  {s['label']} YES={s['market_pct']}% NO@{no_p}%"
-                    f" prog:{s['forecast']:.1f}C edge:+{s['edge']:.1f}%"
-                    f" vol:${s['volume24hr']:,.0f}"
+                    f"  {s['label']}: YES={s['market_pct']}% → NO@{no_p}%"
+                    f" | прогноз {s['forecast']:.1f}C | edge +{s['edge']:.1f}%"
+                    f" | vol ${s['volume24hr']:,.0f}"
                 )
                 lines.append(f"  {s['link']}")
 
         if not signals:
             lines.append("Недооцінених ринків не знайдено.")
+            lines.append("(Перевір чи є активні ринки на завтра/після завтра)")
 
         await context.bot.send_message(
             chat_id=cid,
@@ -2255,9 +2275,11 @@ async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.error("scan_global: %s", e)
+        logger.error("scan_global error: %s", e, exc_info=True)
         await context.bot.send_message(
-            chat_id=cid, text=f"Помилка: {e}", reply_markup=main_keyboard()
+            chat_id=cid,
+            text=f"Помилка сканування: {type(e).__name__}: {e}",
+            reply_markup=main_keyboard(),
         )
 
 
