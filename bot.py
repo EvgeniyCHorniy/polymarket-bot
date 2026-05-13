@@ -1636,56 +1636,73 @@ def _parse_date_from_slug(slug: str) -> datetime | None:
         return None
 
 
+# Кеш прогнозів для глобального сканування (щоб не робити повторних запитів)
+_scan_forecast_cache: dict = {}
+
+
 def get_forecast_for_unknown_city(city_slug: str, dt: datetime, market_type: str) -> dict | None:
     """
-    Отримує прогноз для міста з KNOWN_CITIES по координатах airport station.
-    Якщо міста немає в KNOWN_CITIES — пропускаємо.
+    Отримує прогноз для міста з KNOWN_CITIES.
+    Кешує результати щоб не перевищувати rate limit Open-Meteo.
+    Для сканування використовує тільки ECMWF (1 запит замість 4).
     """
+    import time
+
     cfg = KNOWN_CITIES.get(city_slug)
     if not cfg:
         return None
 
+    # Перевіряємо кеш (ключ: city+date+type)
+    cache_key = f"{city_slug}_{dt.strftime('%Y-%m-%d')}_{market_type}"
+    if cache_key in _scan_forecast_cache:
+        return _scan_forecast_cache[cache_key]
+
     lat, lon, tz = cfg["lat"], cfg["lon"], cfg["tz"]
     ds = dt.strftime("%Y-%m-%d")
 
-    # Отримуємо прогноз з ECMWF + DWD ICON (швидко, без ensemble для сканування)
-    temps = []
-    for url, params in [
-        ("https://api.open-meteo.com/v1/forecast", {
-            "latitude": lat, "longitude": lon,
-            "hourly": "temperature_2m",
-            "timezone": tz, "start_date": ds, "end_date": ds,
-        }),
-        ("https://api.open-meteo.com/v1/dwd-icon", {
-            "latitude": lat, "longitude": lon,
-            "hourly": "temperature_2m",
-            "timezone": tz, "start_date": ds, "end_date": ds,
-        }),
-    ]:
-        data = _safe_get(url, params=params)
-        if not data: continue
-        hourly = data.get("hourly", {})
-        times  = hourly.get("time", [])
-        vals   = hourly.get("temperature_2m", [])
-        day_temps = [
-            float(vals[i]) for i, t in enumerate(times)
-            if t.startswith(ds) and i < len(vals) and vals[i] is not None
-        ]
-        if day_temps:
-            val = min(day_temps) if market_type == "lowest" else max(day_temps)
-            temps.append(val)
+    # Тільки ОДИН запит для сканування (не 4!) — ECMWF через /v1/forecast
+    # Це головний прогноз, достатньо для edge detection
+    data = _safe_get("https://api.open-meteo.com/v1/forecast", params={
+        "latitude":   lat,
+        "longitude":  lon,
+        "hourly":     "temperature_2m",
+        "timezone":   tz,
+        "start_date": ds,
+        "end_date":   ds,
+    })
 
-    if not temps:
+    if not data:
         return None
 
-    forecast_mean = round(sum(temps) / len(temps), 1)
-    return {
-        "mean":       forecast_mean,
-        "final_int":  round(forecast_mean),
-        "sources":    len(temps),
-        "station":    cfg["station"],
-        "tz":         cfg["tz"],
+    hourly = data.get("hourly", {})
+    times  = hourly.get("time", [])
+    vals   = hourly.get("temperature_2m", [])
+    day_temps = [
+        float(vals[i]) for i, t in enumerate(times)
+        if t.startswith(ds) and i < len(vals) and vals[i] is not None
+    ]
+
+    if not day_temps:
+        return None
+
+    val  = min(day_temps) if market_type == "lowest" else max(day_temps)
+    mean = round(val, 1)
+
+    result = {
+        "mean":      mean,
+        "final_int": round(mean),
+        "sources":   1,
+        "station":   cfg["station"],
+        "tz":        cfg["tz"],
     }
+
+    # Зберігаємо в кеш
+    _scan_forecast_cache[cache_key] = result
+
+    # Затримка між запитами щоб не перевищити rate limit
+    time.sleep(0.3)
+
+    return result
 
 
 def analyze_market_edge(
@@ -1780,6 +1797,7 @@ async def scan_global_markets(
     loop = asyncio.get_event_loop()
 
     now          = datetime.utcnow()
+    _scan_forecast_cache.clear()  # очищаємо кеш перед новим скануванням
     target_dates = [
         (now + timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
         for d in days
@@ -1847,7 +1865,9 @@ async def scan_global_markets(
         if all_events:
             return all_events
 
-        # Метод 3: напряму по відомих містах через slug
+        # Метод 3: напряму по відомих містах через Gamma API slug
+        # НЕ робимо Open-Meteo запити тут — тільки Gamma API
+        import time as _time
         known_slugs_cities = [
             "hong-kong", "london", "warsaw", "munich", "paris",
             "seoul", "shanghai", "tokyo", "new-york", "berlin",
@@ -1856,19 +1876,20 @@ async def scan_global_markets(
         from datetime import timedelta as _td
         now_dt = datetime.utcnow()
         for days_ahead in [1, 2]:
-            dt = now_dt + _td(days=days_ahead)
-            date_str = f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
+            dt_check = now_dt + _td(days=days_ahead)
+            date_str = f"{dt_check.strftime('%B').lower()}-{dt_check.day}-{dt_check.year}"
             for city in known_slugs_cities:
-                for mtype in ["highest", "lowest"]:
-                    slug = f"{mtype}-temperature-in-{city}-on-{date_str}"
-                    data = _safe_get(
-                        "https://gamma-api.polymarket.com/events",
-                        params={"slug": slug}
-                    )
-                    if data and isinstance(data, list) and data:
-                        event = data[0]
-                        if event.get("markets") and float(event.get("volume24hr") or 0) > 100:
-                            all_events.append(event)
+                slug = f"highest-temperature-in-{city}-on-{date_str}"
+                data = _safe_get(
+                    "https://gamma-api.polymarket.com/events",
+                    params={"slug": slug}
+                )
+                _time.sleep(0.1)  # невелика пауза між Gamma запитами
+                if data and isinstance(data, list) and data:
+                    event = data[0]
+                    vol = float(event.get("volume24hr") or 0)
+                    if event.get("markets") and vol > 100:
+                        all_events.append(event)
 
         logger.info("Global scan method3 (direct slugs): %d events", len(all_events))
         return all_events
