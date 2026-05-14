@@ -2287,11 +2287,54 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Глобальний пошук недооцінених погодних ринків (YES i NO)."""
     cid = update.effective_chat.id
-    msg = await context.bot.send_message(
+    status_msg = await context.bot.send_message(
         chat_id=cid,
         text="Сканую глобальні ринки (25+ міст)..."
     )
     try:
+        # Запускаємо скан і передаємо callback для статусу
+        from datetime import timedelta as _scan_td
+        now_utc = datetime.utcnow()
+
+        # Крок 1: тягнемо events з Gamma API
+        await context.bot.edit_message_text(
+            chat_id=cid, message_id=status_msg.message_id,
+            text="Крок 1/3: Тягну температурні ринки з Polymarket..."
+        )
+
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        def _quick_fetch():
+            """Швидкий тест Gamma API."""
+            results = {}
+            # Тест 1: slug_url
+            d1 = _safe_get("https://gamma-api.polymarket.com/events", params={
+                "active": "true", "closed": "false",
+                "slug_url": "highest-temperature-in-",
+                "limit": 5, "order": "volume24hr", "ascending": "false",
+            })
+            results["slug_url"] = len(d1) if d1 and isinstance(d1, list) else 0
+
+            # Тест 2: пряме посилання Warsaw завтра
+            from datetime import timedelta
+            tomorrow = (datetime.utcnow() + timedelta(days=1))
+            slug = f"highest-temperature-in-warsaw-on-{tomorrow.strftime('%B').lower()}-{tomorrow.day}-{tomorrow.year}"
+            d2 = _safe_get("https://gamma-api.polymarket.com/events", params={"slug": slug})
+            results["warsaw_direct"] = len(d2) if d2 and isinstance(d2, list) else 0
+
+            # Тест 3: london
+            slug_l = f"highest-temperature-in-london-on-{tomorrow.strftime('%B').lower()}-{tomorrow.day}-{tomorrow.year}"
+            d3 = _safe_get("https://gamma-api.polymarket.com/events", params={"slug": slug_l})
+            results["london_direct"] = len(d3) if d3 and isinstance(d3, list) else 0
+
+            return results
+
+        test_results = await loop.run_in_executor(None, _quick_fetch)
+        await context.bot.edit_message_text(
+            chat_id=cid, message_id=status_msg.message_id,
+            text=f"Тест: slug_url={test_results['slug_url']} warsaw={test_results['warsaw_direct']} london={test_results['london_direct']}. Крок 2/3..."
+        )
         signals    = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
         yes_sigs   = [s for s in signals if s["type"] == "YES"]
         no_sigs    = [s for s in signals if s["type"] == "NO"]
@@ -2334,8 +2377,13 @@ async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if not signals:
             lines.append("Недооцінених ринків не знайдено.")
-            lines.append("(Перевір чи є активні ринки на завтра/після завтра)")
+            lines.append(f"(Тест API: slug_url={test_results.get('slug_url',0)}, warsaw={test_results.get('warsaw_direct',0)}, london={test_results.get('london_direct',0)})")
+            lines.append("Можливо ринки на завтра ще не відкрились або всі edge < 8%.")
 
+        await context.bot.edit_message_text(
+            chat_id=cid, message_id=status_msg.message_id,
+            text="Готово! Результати нижче:"
+        )
         await context.bot.send_message(
             chat_id=cid,
             text="\n".join(lines),
