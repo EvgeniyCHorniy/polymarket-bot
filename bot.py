@@ -1788,29 +1788,36 @@ async def scan_global_markets(
     days: list[int] = [1, 2],
     min_volume: int = MIN_VOLUME_USD,
 ) -> list[dict]:
-    """Глобальний скан: перевіряємо відомі міста напряму через Gamma API."""
+    """Глобальний скан погодних ринків."""
     import asyncio
+    import concurrent.futures
+
     now = datetime.utcnow()
     _scan_forecast_cache.clear()
     all_signals = []
     found_events = 0
 
-    logger.info("Global scan START, days=%s", days)
+    logger.info("Global scan START days=%s cities=%d", days, len(KNOWN_CITIES))
+
+    # Використовуємо ThreadPoolExecutor явно
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    loop = asyncio.get_running_loop()  # Python 3.10+ правильний спосіб
 
     for d in days:
         market_date = (now + timedelta(days=d)).replace(
             hour=0, minute=0, second=0, microsecond=0)
-        date_str = f"{market_date.strftime('%B').lower()}-{market_date.day}-{market_date.year}"
+        date_str = (f"{market_date.strftime('%B').lower()}-"
+                    f"{market_date.day}-{market_date.year}")
 
         for city_slug, cfg in KNOWN_CITIES.items():
             slug = f"highest-temperature-in-{city_slug}-on-{date_str}"
-            logger.info("Global scan checking: %s", slug)
+            logger.info("Scan: %s", city_slug)
 
+            # Gamma API запит
             try:
-                # Простий синхронний запит в окремому потоці з таймаутом
                 data = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None,
+                    loop.run_in_executor(
+                        executor,
                         lambda s=slug: _safe_get(
                             "https://gamma-api.polymarket.com/events",
                             params={"slug": s}
@@ -1818,14 +1825,12 @@ async def scan_global_markets(
                     ),
                     timeout=10.0
                 )
-            except asyncio.TimeoutError:
-                logger.warning("Timeout: %s", slug)
-                continue
             except Exception as e:
-                logger.error("Error %s: %s", slug, e)
+                logger.warning("Gamma timeout/error %s: %s", city_slug, e)
                 continue
 
             if not data or not isinstance(data, list) or not data:
+                logger.debug("No data for %s", slug)
                 continue
 
             event    = data[0]
@@ -1836,31 +1841,34 @@ async def scan_global_markets(
                 continue
 
             found_events += 1
+            logger.info("Found event: %s vol=$%.0f", city_slug, volume24)
+
             outcomes = parse_all_outcomes(markets)
             if not outcomes:
                 continue
 
-            # Прогноз - теж в executor з таймаутом
+            # Прогноз
             try:
                 fc = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda c=city_slug, dt=market_date: get_forecast_for_unknown_city(c, dt, "highest")
+                    loop.run_in_executor(
+                        executor,
+                        lambda c=city_slug, dt=market_date: get_forecast_for_unknown_city(
+                            c, dt, "highest")
                     ),
-                    timeout=12.0
+                    timeout=15.0
                 )
-            except asyncio.TimeoutError:
-                logger.warning("Forecast timeout: %s", city_slug)
-                continue
             except Exception as e:
-                logger.error("Forecast error %s: %s", city_slug, e)
+                logger.warning("Forecast timeout %s: %s", city_slug, e)
                 continue
 
             if not fc:
                 continue
 
-            signals = analyze_market_edge(outcomes, fc["mean"], fc["final_int"], "highest")
-            link    = f"https://polymarket.com/event/{slug}"
+            logger.info("Forecast %s: %.1fC", city_slug, fc["mean"])
+
+            signals = analyze_market_edge(
+                outcomes, fc["mean"], fc["final_int"], "highest")
+            link = f"https://polymarket.com/event/{slug}"
 
             for sig in signals:
                 all_signals.append({
@@ -1874,10 +1882,10 @@ async def scan_global_markets(
                     "link":        link,
                 })
 
-            # Невелика пауза між містами
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-    logger.info("Global scan DONE: %d events, %d signals", found_events, len(all_signals))
+    executor.shutdown(wait=False)
+    logger.info("Global scan DONE: events=%d signals=%d", found_events, len(all_signals))
     all_signals.sort(key=lambda x: (-x["edge"], -x["volume24hr"]))
     return all_signals
 
