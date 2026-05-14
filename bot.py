@@ -1788,20 +1788,19 @@ async def scan_global_markets(
     days: list[int] = [1, 2],
     min_volume: int = MIN_VOLUME_USD,
 ) -> list[dict]:
-    """Глобальний скан погодних ринків."""
+    """
+    Глобальний скан. Робить синхронні HTTP запити напряму —
+    без executor, без threading. Простіше і надійніше.
+    """
     import asyncio
-    import concurrent.futures
+    import time
 
     now = datetime.utcnow()
     _scan_forecast_cache.clear()
     all_signals = []
     found_events = 0
 
-    logger.info("Global scan START days=%s cities=%d", days, len(KNOWN_CITIES))
-
-    # Використовуємо ThreadPoolExecutor явно
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-    loop = asyncio.get_running_loop()  # Python 3.10+ правильний спосіб
+    logger.info("Global scan START days=%s", days)
 
     for d in days:
         market_date = (now + timedelta(days=d)).replace(
@@ -1811,26 +1810,19 @@ async def scan_global_markets(
 
         for city_slug, cfg in KNOWN_CITIES.items():
             slug = f"highest-temperature-in-{city_slug}-on-{date_str}"
-            logger.info("Scan: %s", city_slug)
 
-            # Gamma API запит
+            # Gamma API — синхронний запит
             try:
-                data = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        executor,
-                        lambda s=slug: _safe_get(
-                            "https://gamma-api.polymarket.com/events",
-                            params={"slug": s}
-                        )
-                    ),
-                    timeout=10.0
+                data = _safe_get(
+                    "https://gamma-api.polymarket.com/events",
+                    params={"slug": slug}
                 )
             except Exception as e:
-                logger.warning("Gamma timeout/error %s: %s", city_slug, e)
+                logger.warning("Gamma error %s: %s", city_slug, e)
                 continue
 
             if not data or not isinstance(data, list) or not data:
-                logger.debug("No data for %s", slug)
+                await asyncio.sleep(0)  # yield control
                 continue
 
             event    = data[0]
@@ -1838,33 +1830,25 @@ async def scan_global_markets(
             volume24 = float(event.get("volume24hr") or 0)
 
             if not markets or volume24 < min_volume:
+                await asyncio.sleep(0)
                 continue
 
             found_events += 1
-            logger.info("Found event: %s vol=$%.0f", city_slug, volume24)
+            logger.info("Scan found: %s vol=$%.0f", city_slug, volume24)
 
             outcomes = parse_all_outcomes(markets)
             if not outcomes:
                 continue
 
-            # Прогноз
+            # Прогноз — синхронний запит
             try:
-                fc = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        executor,
-                        lambda c=city_slug, dt=market_date: get_forecast_for_unknown_city(
-                            c, dt, "highest")
-                    ),
-                    timeout=15.0
-                )
+                fc = get_forecast_for_unknown_city(city_slug, market_date, "highest")
             except Exception as e:
-                logger.warning("Forecast timeout %s: %s", city_slug, e)
+                logger.warning("Forecast error %s: %s", city_slug, e)
                 continue
 
             if not fc:
                 continue
-
-            logger.info("Forecast %s: %.1fC", city_slug, fc["mean"])
 
             signals = analyze_market_edge(
                 outcomes, fc["mean"], fc["final_int"], "highest")
@@ -1882,9 +1866,9 @@ async def scan_global_markets(
                     "link":        link,
                 })
 
-            await asyncio.sleep(0.3)
+            # Yield control і пауза між запитами
+            await asyncio.sleep(0.5)
 
-    executor.shutdown(wait=False)
     logger.info("Global scan DONE: events=%d signals=%d", found_events, len(all_signals))
     all_signals.sort(key=lambda x: (-x["edge"], -x["volume24hr"]))
     return all_signals
