@@ -1789,183 +1789,92 @@ async def scan_global_markets(
     min_volume: int = MIN_VOLUME_USD,
 ) -> list[dict]:
     """
-    Тягне всі активні температурні ринки через Gamma API.
-    Запускає синхронні HTTP запити в executor щоб не блокувати event loop.
-    Аналізує і YES BUY і NO FADE сигнали.
+    Глобальний скан: пряме сканування відомих міст через Gamma API + прогноз.
+    Простий sequential підхід з таймаутами.
     """
     import asyncio
-    loop = asyncio.get_event_loop()
+    now = datetime.utcnow()
+    _scan_forecast_cache.clear()
 
-    now          = datetime.utcnow()
-    _scan_forecast_cache.clear()  # очищаємо кеш перед новим скануванням
-    target_dates = [
-        (now + timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
-        for d in days
-    ]
+    # Будуємо список slug для перевірки
+    slugs_to_check = []
+    for d in days:
+        dt = (now + timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
+        date_str = f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
+        for city_slug in KNOWN_CITIES:
+            slugs_to_check.append((city_slug, dt, "highest",
+                f"highest-temperature-in-{city_slug}-on-{date_str}"))
 
-    def _fetch_events() -> list[dict]:
-        """
-        Тягне температурні ринки через Gamma API.
-        Правильний підхід: використовуємо slug_url параметр для пошуку по slug.
-        Gamma API підтримує пошук по частині slug через параметр 'slugUrl'.
-        """
-        all_events = []
-
-        # Метод 1: шукаємо по slug prefix — найнадійніший
-        for prefix in ["highest-temperature-in-", "lowest-temperature-in-"]:
-            offset = 0
-            while True:
-                data = _safe_get(
-                    "https://gamma-api.polymarket.com/events",
-                    params={
-                        "active":      "true",
-                        "closed":      "false",
-                        "slug_url":    prefix,
-                        "limit":       100,
-                        "offset":      offset,
-                        "order":       "volume24hr",
-                        "ascending":   "false",
-                    }
-                )
-                if not data or not isinstance(data, list) or not data:
-                    break
-                temp = [e for e in data if prefix in e.get("slug", "")]
-                all_events.extend(temp)
-                logger.info("Global scan slug=%s offset=%d got %d events", prefix, offset, len(temp))
-                if len(data) < 100:
-                    break
-                offset += 100
-                if offset > 1000:
-                    break
-
-        if all_events:
-            logger.info("Global scan method1: %d events", len(all_events))
-            return all_events
-
-        # Метод 2: tag_slug (може не працювати але пробуємо)
-        for tag in ["temperature", "weather"]:
-            data = _safe_get(
-                "https://gamma-api.polymarket.com/events",
-                params={
-                    "active":    "true",
-                    "closed":    "false",
-                    "tag_slug":  tag,
-                    "limit":     100,
-                    "order":     "volume24hr",
-                    "ascending": "false",
-                }
-            )
-            if data and isinstance(data, list):
-                temp = [e for e in data if "temperature-in-" in e.get("slug", "")]
-                if temp:
-                    all_events.extend(temp)
-                    logger.info("Global scan tag=%s: %d events", tag, len(temp))
-                    break
-
-        if all_events:
-            return all_events
-
-        # Метод 3: напряму по відомих містах через Gamma API slug
-        # НЕ робимо Open-Meteo запити тут — тільки Gamma API
-        import time as _time
-        known_slugs_cities = [
-            "hong-kong", "london", "warsaw", "munich", "paris",
-            "seoul", "shanghai", "tokyo", "new-york", "berlin",
-            "singapore", "dubai", "istanbul", "amsterdam",
-        ]
-        from datetime import timedelta as _td
-        now_dt = datetime.utcnow()
-        for days_ahead in [1, 2]:
-            dt_check = now_dt + _td(days=days_ahead)
-            date_str = f"{dt_check.strftime('%B').lower()}-{dt_check.day}-{dt_check.year}"
-            for city in known_slugs_cities:
-                slug = f"highest-temperature-in-{city}-on-{date_str}"
-                data = _safe_get(
-                    "https://gamma-api.polymarket.com/events",
-                    params={"slug": slug}
-                )
-                _time.sleep(0.1)  # невелика пауза між Gamma запитами
-                if data and isinstance(data, list) and data:
-                    event = data[0]
-                    vol = float(event.get("volume24hr") or 0)
-                    if event.get("markets") and vol > 100:
-                        all_events.append(event)
-
-        logger.info("Global scan method3 (direct slugs): %d events", len(all_events))
-        return all_events
-
-    def _get_forecast(city_slug: str, dt: datetime, market_type: str) -> dict | None:
-        return get_forecast_for_unknown_city(city_slug, dt, market_type)
-
-    # Тягнемо events в executor
-    all_events = await loop.run_in_executor(None, _fetch_events)
-    logger.info("Global scan: %d temp events total", len(all_events))
-
-    if not all_events:
-        logger.warning("Global scan: no events found!")
-        return []
+    logger.info("Global scan: checking %d slugs", len(slugs_to_check))
 
     all_signals = []
-    processed   = 0
+    found_events = 0
+    loop = asyncio.get_event_loop()
 
-    for event in all_events:
-        slug       = event.get("slug", "")
-        volume24hr = float(event.get("volume24hr") or 0)
-        markets    = event.get("markets", [])
+    for city_slug, market_date, market_type, slug in slugs_to_check:
+        try:
+            # Тягнемо event з Gamma API (з таймаутом 8 сек)
+            def _fetch_one(s):
+                return _safe_get("https://gamma-api.polymarket.com/events", params={"slug": s})
 
-        if not markets:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch_one, slug),
+                timeout=8.0
+            )
+
+            if not data or not isinstance(data, list) or not data:
+                continue
+            event = data[0]
+            markets = event.get("markets", [])
+            if not markets:
+                continue
+            volume24hr = float(event.get("volume24hr") or 0)
+            if volume24hr < min_volume:
+                continue
+
+            found_events += 1
+            outcomes = parse_all_outcomes(markets)
+            if not outcomes:
+                continue
+
+            # Прогноз (кешований, з sleep 0.3 всередині)
+            cfg = KNOWN_CITIES.get(city_slug, {})
+            def _get_fc():
+                return get_forecast_for_unknown_city(city_slug, market_date, market_type)
+
+            fc = await asyncio.wait_for(
+                loop.run_in_executor(None, _get_fc),
+                timeout=10.0
+            )
+            if not fc:
+                continue
+
+            signals = analyze_market_edge(outcomes, fc["mean"], fc["final_int"], market_type)
+            link = f"https://polymarket.com/event/{slug}"
+
+            for sig in signals:
+                all_signals.append({
+                    **sig,
+                    "city":        city_slug,
+                    "station":     cfg.get("station", "?"),
+                    "market_type": market_type,
+                    "date":        market_date,
+                    "volume24hr":  volume24hr,
+                    "forecast":    fc["mean"],
+                    "link":        link,
+                })
+
+        except asyncio.TimeoutError:
+            logger.warning("Timeout for %s", slug)
             continue
-        if volume24hr < min_volume:
-            continue
-        if "temperature-in-" not in slug:
-            continue
-
-        city_slug   = _parse_city_from_slug(slug)
-        market_type = _parse_market_type_from_slug(slug)
-        market_date = _parse_date_from_slug(slug)
-
-        if not city_slug or not market_date:
+        except Exception as e:
+            logger.error("Scan error %s: %s", city_slug, e)
             continue
 
-        # Фільтр по горизонту
-        if market_date.date() not in [d.date() for d in target_dates]:
-            continue
-
-        cfg = KNOWN_CITIES.get(city_slug)
-        if not cfg:
-            logger.debug("Unknown city slug: %s", city_slug)
-            continue
-
-        # Прогноз в executor
-        fc = await loop.run_in_executor(
-            None, _get_forecast, city_slug, market_date, market_type
-        )
-        if not fc:
-            continue
-
-        processed += 1
-        outcomes = parse_all_outcomes(markets)
-        if not outcomes:
-            continue
-
-        signals = analyze_market_edge(outcomes, fc["mean"], fc["final_int"], market_type)
-        link    = f"https://polymarket.com/event/{slug}"
-
-        for sig in signals:
-            all_signals.append({
-                **sig,
-                "city":        city_slug,
-                "station":     cfg["station"],
-                "market_type": market_type,
-                "date":        market_date,
-                "volume24hr":  volume24hr,
-                "forecast":    fc["mean"],
-                "link":        link,
-            })
-
-    logger.info("Global scan done: %d cities, %d signals", processed, len(all_signals))
+    logger.info("Global scan: %d events found, %d signals", found_events, len(all_signals))
     all_signals.sort(key=lambda x: (-x["edge"], -x["volume24hr"]))
     return all_signals
+
 
 
 def format_global_scan_results(signals: list[dict], max_results: int = 10) -> str:
@@ -2296,45 +2205,6 @@ async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         from datetime import timedelta as _scan_td
         now_utc = datetime.utcnow()
 
-        # Крок 1: тягнемо events з Gamma API
-        await context.bot.edit_message_text(
-            chat_id=cid, message_id=status_msg.message_id,
-            text="Крок 1/3: Тягну температурні ринки з Polymarket..."
-        )
-
-        import asyncio
-        loop = asyncio.get_event_loop()
-
-        def _quick_fetch():
-            """Швидкий тест Gamma API."""
-            results = {}
-            # Тест 1: slug_url
-            d1 = _safe_get("https://gamma-api.polymarket.com/events", params={
-                "active": "true", "closed": "false",
-                "slug_url": "highest-temperature-in-",
-                "limit": 5, "order": "volume24hr", "ascending": "false",
-            })
-            results["slug_url"] = len(d1) if d1 and isinstance(d1, list) else 0
-
-            # Тест 2: пряме посилання Warsaw завтра
-            from datetime import timedelta
-            tomorrow = (datetime.utcnow() + timedelta(days=1))
-            slug = f"highest-temperature-in-warsaw-on-{tomorrow.strftime('%B').lower()}-{tomorrow.day}-{tomorrow.year}"
-            d2 = _safe_get("https://gamma-api.polymarket.com/events", params={"slug": slug})
-            results["warsaw_direct"] = len(d2) if d2 and isinstance(d2, list) else 0
-
-            # Тест 3: london
-            slug_l = f"highest-temperature-in-london-on-{tomorrow.strftime('%B').lower()}-{tomorrow.day}-{tomorrow.year}"
-            d3 = _safe_get("https://gamma-api.polymarket.com/events", params={"slug": slug_l})
-            results["london_direct"] = len(d3) if d3 and isinstance(d3, list) else 0
-
-            return results
-
-        test_results = await loop.run_in_executor(None, _quick_fetch)
-        await context.bot.edit_message_text(
-            chat_id=cid, message_id=status_msg.message_id,
-            text=f"Тест: slug_url={test_results['slug_url']} warsaw={test_results['warsaw_direct']} london={test_results['london_direct']}. Крок 2/3..."
-        )
         signals    = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
         yes_sigs   = [s for s in signals if s["type"] == "YES"]
         no_sigs    = [s for s in signals if s["type"] == "NO"]
@@ -2377,7 +2247,6 @@ async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if not signals:
             lines.append("Недооцінених ринків не знайдено.")
-            lines.append(f"(Тест API: slug_url={test_results.get('slug_url',0)}, warsaw={test_results.get('warsaw_direct',0)}, london={test_results.get('london_direct',0)})")
             lines.append("Можливо ринки на завтра ще не відкрились або всі edge < 8%.")
 
         await context.bot.edit_message_text(
