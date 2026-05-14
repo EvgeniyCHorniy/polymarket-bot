@@ -1788,48 +1788,51 @@ async def scan_global_markets(
     days: list[int] = [1, 2],
     min_volume: int = MIN_VOLUME_USD,
 ) -> list[dict]:
-    """
-    Глобальний скан: пряме сканування відомих міст через Gamma API + прогноз.
-    Простий sequential підхід з таймаутами.
-    """
+    """Глобальний скан: перевіряємо відомі міста напряму через Gamma API."""
     import asyncio
     now = datetime.utcnow()
     _scan_forecast_cache.clear()
-
-    # Будуємо список slug для перевірки
-    slugs_to_check = []
-    for d in days:
-        dt = (now + timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
-        date_str = f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
-        for city_slug in KNOWN_CITIES:
-            slugs_to_check.append((city_slug, dt, "highest",
-                f"highest-temperature-in-{city_slug}-on-{date_str}"))
-
-    logger.info("Global scan: checking %d slugs", len(slugs_to_check))
-
     all_signals = []
     found_events = 0
-    loop = asyncio.get_event_loop()
 
-    for city_slug, market_date, market_type, slug in slugs_to_check:
-        try:
-            # Тягнемо event з Gamma API (з таймаутом 8 сек)
-            def _fetch_one(s):
-                return _safe_get("https://gamma-api.polymarket.com/events", params={"slug": s})
+    logger.info("Global scan START, days=%s", days)
 
-            data = await asyncio.wait_for(
-                loop.run_in_executor(None, _fetch_one, slug),
-                timeout=8.0
-            )
+    for d in days:
+        market_date = (now + timedelta(days=d)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        date_str = f"{market_date.strftime('%B').lower()}-{market_date.day}-{market_date.year}"
+
+        for city_slug, cfg in KNOWN_CITIES.items():
+            slug = f"highest-temperature-in-{city_slug}-on-{date_str}"
+            logger.info("Global scan checking: %s", slug)
+
+            try:
+                # Простий синхронний запит в окремому потоці з таймаутом
+                data = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda s=slug: _safe_get(
+                            "https://gamma-api.polymarket.com/events",
+                            params={"slug": s}
+                        )
+                    ),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout: %s", slug)
+                continue
+            except Exception as e:
+                logger.error("Error %s: %s", slug, e)
+                continue
 
             if not data or not isinstance(data, list) or not data:
                 continue
-            event = data[0]
-            markets = event.get("markets", [])
-            if not markets:
-                continue
-            volume24hr = float(event.get("volume24hr") or 0)
-            if volume24hr < min_volume:
+
+            event    = data[0]
+            markets  = event.get("markets", [])
+            volume24 = float(event.get("volume24hr") or 0)
+
+            if not markets or volume24 < min_volume:
                 continue
 
             found_events += 1
@@ -1837,41 +1840,44 @@ async def scan_global_markets(
             if not outcomes:
                 continue
 
-            # Прогноз (кешований, з sleep 0.3 всередині)
-            cfg = KNOWN_CITIES.get(city_slug, {})
-            def _get_fc():
-                return get_forecast_for_unknown_city(city_slug, market_date, market_type)
+            # Прогноз - теж в executor з таймаутом
+            try:
+                fc = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda c=city_slug, dt=market_date: get_forecast_for_unknown_city(c, dt, "highest")
+                    ),
+                    timeout=12.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Forecast timeout: %s", city_slug)
+                continue
+            except Exception as e:
+                logger.error("Forecast error %s: %s", city_slug, e)
+                continue
 
-            fc = await asyncio.wait_for(
-                loop.run_in_executor(None, _get_fc),
-                timeout=10.0
-            )
             if not fc:
                 continue
 
-            signals = analyze_market_edge(outcomes, fc["mean"], fc["final_int"], market_type)
-            link = f"https://polymarket.com/event/{slug}"
+            signals = analyze_market_edge(outcomes, fc["mean"], fc["final_int"], "highest")
+            link    = f"https://polymarket.com/event/{slug}"
 
             for sig in signals:
                 all_signals.append({
                     **sig,
                     "city":        city_slug,
                     "station":     cfg.get("station", "?"),
-                    "market_type": market_type,
+                    "market_type": "highest",
                     "date":        market_date,
-                    "volume24hr":  volume24hr,
+                    "volume24hr":  volume24,
                     "forecast":    fc["mean"],
                     "link":        link,
                 })
 
-        except asyncio.TimeoutError:
-            logger.warning("Timeout for %s", slug)
-            continue
-        except Exception as e:
-            logger.error("Scan error %s: %s", city_slug, e)
-            continue
+            # Невелика пауза між містами
+            await asyncio.sleep(0.5)
 
-    logger.info("Global scan: %d events found, %d signals", found_events, len(all_signals))
+    logger.info("Global scan DONE: %d events, %d signals", found_events, len(all_signals))
     all_signals.sort(key=lambda x: (-x["edge"], -x["volume24hr"]))
     return all_signals
 
@@ -2194,79 +2200,47 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_scan_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Глобальний пошук недооцінених погодних ринків (YES i NO)."""
+    """Глобальний пошук недооцінених погодних ринків."""
     cid = update.effective_chat.id
-    status_msg = await context.bot.send_message(
-        chat_id=cid,
-        text="Сканую глобальні ринки (25+ міст)..."
-    )
+    await context.bot.send_message(chat_id=cid, text="Сканую... (1-2 хв)")
     try:
-        # Запускаємо скан і передаємо callback для статусу
-        from datetime import timedelta as _scan_td
-        now_utc = datetime.utcnow()
-
-        signals    = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
-        yes_sigs   = [s for s in signals if s["type"] == "YES"]
-        no_sigs    = [s for s in signals if s["type"] == "NO"]
-        lines      = [f"Scan: {len(signals)} сигналів ({len(yes_sigs)} YES, {len(no_sigs)} NO)"]
+        signals  = await scan_global_markets(days=[1, 2], min_volume=MIN_VOLUME_USD)
+        yes_sigs = [s for s in signals if s["type"] == "YES"]
+        no_sigs  = [s for s in signals if s["type"] == "NO"]
+        lines    = [f"Scan: {len(signals)} ({len(yes_sigs)} YES, {len(no_sigs)} NO)"]
 
         if yes_sigs:
-            lines.append("\nYES BUY (недооцінені):")
+            lines.append("\nYES BUY:")
             for s in yes_sigs[:6]:
-                cfg = KNOWN_CITIES.get(s["city"], {})
-                utc = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
-                mtype = "Max" if s["market_type"] == "highest" else "Min"
-                lines.append(
-                    f"  {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
-                    f" [{s['station']} UTC{utc:+d}]"
-                )
-                lines.append(
-                    f"  {s['label']} @ {s['market_pct']}%"
-                    f" | прогноз {s['forecast']:.1f}C | edge +{s['edge']:.1f}%"
-                    f" | vol ${s['volume24hr']:,.0f}"
-                )
+                cfg  = KNOWN_CITIES.get(s["city"], {})
+                utc  = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
+                lines.append(f"  {s['city'].upper()} [{s['station']} UTC{utc:+d}] {s['date'].strftime('%d.%m')}")
+                lines.append(f"  {s['label']}@{s['market_pct']}% prog:{s['forecast']:.1f}C edge:+{s['edge']:.1f}% vol:${s['volume24hr']:,.0f}")
                 lines.append(f"  {s['link']}")
 
         if no_sigs:
-            lines.append("\nNO FADE (переоцінені):")
+            lines.append("\nNO FADE:")
             for s in no_sigs[:6]:
-                cfg   = KNOWN_CITIES.get(s["city"], {})
-                utc   = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
-                mtype = "Max" if s["market_type"] == "highest" else "Min"
-                no_p  = s.get("no_price", round(100 - s["market_pct"], 1))
-                lines.append(
-                    f"  {s['city'].upper()} {mtype} {s['date'].strftime('%d.%m')}"
-                    f" [{s['station']} UTC{utc:+d}]"
-                )
-                lines.append(
-                    f"  {s['label']}: YES={s['market_pct']}% → NO@{no_p}%"
-                    f" | прогноз {s['forecast']:.1f}C | edge +{s['edge']:.1f}%"
-                    f" | vol ${s['volume24hr']:,.0f}"
-                )
+                cfg  = KNOWN_CITIES.get(s["city"], {})
+                utc  = TZ_UTC_OFFSET.get(cfg.get("tz", ""), 0)
+                no_p = s.get("no_price", round(100 - s["market_pct"], 1))
+                lines.append(f"  {s['city'].upper()} [{s['station']} UTC{utc:+d}] {s['date'].strftime('%d.%m')}")
+                lines.append(f"  {s['label']} YES={s['market_pct']}% NO@{no_p}% prog:{s['forecast']:.1f}C edge:+{s['edge']:.1f}% vol:${s['volume24hr']:,.0f}")
                 lines.append(f"  {s['link']}")
 
         if not signals:
-            lines.append("Недооцінених ринків не знайдено.")
-            lines.append("Можливо ринки на завтра ще не відкрились або всі edge < 8%.")
+            lines.append("Сигналів не знайдено (edge < 8% або ринків немає).")
 
-        await context.bot.edit_message_text(
-            chat_id=cid, message_id=status_msg.message_id,
-            text="Готово! Результати нижче:"
-        )
         await context.bot.send_message(
-            chat_id=cid,
-            text="\n".join(lines),
-            reply_markup=main_keyboard(),
-            disable_web_page_preview=True,
+            chat_id=cid, text="\n".join(lines),
+            reply_markup=main_keyboard(), disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.error("scan_global error: %s", e, exc_info=True)
+        logger.error("scan_global: %s", e, exc_info=True)
         await context.bot.send_message(
-            chat_id=cid,
-            text=f"Помилка сканування: {type(e).__name__}: {e}",
+            chat_id=cid, text=f"Помилка: {type(e).__name__}: {e}",
             reply_markup=main_keyboard(),
         )
-
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
